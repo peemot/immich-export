@@ -1,0 +1,50 @@
+# Configuration files with sensitive data
+config.json
+config.local.json
+*.env
+
+# Log files
+*.log
+thumbnail_fix.log
+
+# Output directories
+digikam_xmp_sidecars/
+face_recognition_data.json
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db

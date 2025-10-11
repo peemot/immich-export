@@ -1,0 +1,14 @@
+{
+  "immich": {
+    "base_url": "https://your-immich-server.com",
+    "email": "your-email@example.com",
+    "password": "your-password"
+  },
+  "settings": {
+    "request_timeout": 30,
+    "retry_attempts": 3
+  },
+  "output": {
+    "digikam_xmp_dir": "digikam_xmp_sidecars"
+  }
+}
