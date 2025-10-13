@@ -3,11 +3,13 @@
 Face recognition export script for Immich.
 Uses search API to get asset IDs, then detailed API to get face data.
 Exports face recognition data to DigiKam-compatible XMP format.
+Supports two-stage processing: JSON export first, then XMP generation.
 """
 
 import requests
 import json
 import os
+import argparse
 from typing import Dict, Any, Optional, List
 from datetime import datetime
 from pathlib import Path
@@ -98,7 +100,8 @@ class ConfigLoader:
     def get_output_config(self) -> Dict[str, str]:
         """Get output configuration."""
         return {
-            'digikam_xmp_dir': self.get('output.digikam_xmp_dir', 'digikam_xmp_sidecars')
+            'digikam_xmp_dir': self.get('output.digikam_xmp_dir', 'digikam_xmp_sidecars'),
+            'json_export_dir': self.get('output.json_export_dir', 'json_exports')
         }
     
     def get_settings_config(self) -> Dict[str, Any]:
@@ -174,7 +177,7 @@ def get_auth_headers(access_token: str) -> Dict[str, str]:
     return headers
 
 
-def get_all_asset_ids(access_token: str) -> List[str]:
+def get_all_asset_ids(access_token: str, max_assets: Optional[int] = None) -> List[str]:
     """Get all asset IDs efficiently using search API."""
     asset_ids = []
     page = 1
@@ -182,6 +185,10 @@ def get_all_asset_ids(access_token: str) -> List[str]:
     print("Collecting asset IDs...")
     
     while True:
+        # Check if we've reached the maximum number of assets
+        if max_assets is not None and len(asset_ids) >= max_assets:
+            print(f"  Reached maximum asset limit: {max_assets}")
+            break
         try:
             # Search for assets - just get basic info with IDs
             search_payload = {
@@ -206,6 +213,15 @@ def get_all_asset_ids(access_token: str) -> List[str]:
                 
             # Extract just the IDs
             page_ids = [item.get('id', '') for item in items if item.get('id')]
+            
+            # Apply max_assets limit if specified
+            if max_assets is not None:
+                remaining_slots = max_assets - len(asset_ids)
+                if remaining_slots <= 0:
+                    break
+                # Only take what we need to reach the limit
+                page_ids = page_ids[:remaining_slots]
+            
             asset_ids.extend(page_ids)
             
             print(f"  Page {page}: Collected {len(page_ids)} IDs, total: {len(asset_ids)}")
@@ -378,18 +394,23 @@ def save_xmp_sidecar(original_path: str, xmp_content: str, output_dir: str = "")
         return False
 
 
-def process_assets_with_faces(access_token: str) -> List[Dict[str, Any]]:
+def process_assets_with_faces(access_token: str, max_assets: Optional[int] = None) -> List[Dict[str, Any]]:
     """Process assets and collect those with face recognition data."""
     processed_assets = []
     
     print("Step 1: Collecting asset IDs...")
-    asset_ids = get_all_asset_ids(access_token)
+    asset_ids = get_all_asset_ids(access_token, max_assets)
     
     if not asset_ids:
         print("No asset IDs collected")
         return processed_assets
     
     print(f"\nStep 2: Processing {len(asset_ids)} assets for face data...")
+    
+    # Apply max_assets limit to processing loop as well
+    if max_assets is not None:
+        asset_ids = asset_ids[:max_assets]
+        print(f"  Limited to processing {len(asset_ids)} assets (max_assets limit)")
     
     # Process assets one by one to avoid hardcoded batch limits
     total_with_faces = 0
@@ -428,7 +449,147 @@ def process_assets_with_faces(access_token: str) -> List[Dict[str, Any]]:
     return processed_assets
 
 
-def export_faces_to_digikam_xmp(access_token: str, output_dir: str = "xmp_sidecars") -> bool:
+def export_faces_to_json(access_token: str, json_output_dir: str = "json_exports", max_assets: Optional[int] = None) -> Optional[str]:
+    """Export face recognition data to JSON file (Stage 1)."""
+    print("Starting face recognition export to JSON format (Stage 1)...")
+    
+    # Create output directory
+    output_path = Path(json_output_dir)
+    output_path.mkdir(exist_ok=True)
+    
+    # Process assets with faces
+    processed_assets = process_assets_with_faces(access_token, max_assets)
+    
+    if not processed_assets:
+        print("No assets with faces found")
+        return None
+    
+    # Create comprehensive JSON export
+    export_data = {
+        'export_timestamp': datetime.now().isoformat(),
+        'immich_server': IMMICH_BASE_URL,
+        'total_assets': len(processed_assets),
+        'assets': processed_assets
+    }
+    
+    # Generate filename with timestamp
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    json_filename = f"immich_faces_export_{timestamp}.json"
+    json_file_path = output_path / json_filename
+    
+    try:
+        with open(json_file_path, 'w', encoding='utf-8') as f:
+            json.dump(export_data, f, indent=2, ensure_ascii=False)
+        
+        print(f"✅ JSON export completed!")
+        print(f"📊 Statistics:")
+        print(f"   Total assets with faces: {len(processed_assets)}")
+        print(f"   JSON file: {json_file_path}")
+        
+        return str(json_file_path)
+        
+    except IOError as e:
+        print(f"❌ Error saving JSON file: {e}")
+        return None
+
+
+def export_faces_to_digikam_xmp_from_json(json_file_path: str, output_dir: str = "xmp_sidecars") -> bool:
+    """Export face recognition data to DigiKam XMP format from JSON file (Stage 2)."""
+    print(f"Starting face recognition export to DigiKam XMP format from JSON file (Stage 2)...")
+    print(f"JSON source: {json_file_path}")
+    
+    try:
+        # Load JSON data
+        with open(json_file_path, 'r', encoding='utf-8') as f:
+            export_data = json.load(f)
+        
+        processed_assets = export_data.get('assets', [])
+        
+        if not processed_assets:
+            print("No assets found in JSON file")
+            return False
+        
+        print(f"Loaded {len(processed_assets)} assets from JSON file")
+        
+    except (IOError, json.JSONDecodeError) as e:
+        print(f"❌ Error loading JSON file: {e}")
+        return False
+    
+    # Create output directory
+    output_path = Path(output_dir)
+    output_path.mkdir(exist_ok=True)
+    
+    total_files_created = 0
+    total_faces_processed = 0
+    person_stats = {}
+    
+    print(f"\nCreating XMP files for {len(processed_assets)} assets with faces...")
+    
+    for i, asset_data in enumerate(processed_assets):
+        people_data = asset_data.get('people', [])
+        
+        if people_data:
+            # Create XMP content
+            xmp_content = create_digikam_xmp_content(asset_data)
+            
+            if xmp_content.strip():  # Only proceed if XMP content is not empty
+                # Save XMP sidecar file
+                original_path = asset_data.get('original_path', f"unknown_{asset_data['asset_id']}.jpg")
+                if save_xmp_sidecar(original_path, xmp_content, str(output_path)):
+                    total_files_created += 1
+                    total_faces_processed += sum(len(person.get('faces', [])) for person in people_data)
+                    
+                    # Update person statistics
+                    for person in people_data:
+                        person_name = person.get('name', 'Unknown')
+                        if person_name not in person_stats:
+                            person_stats[person_name] = 0
+                        person_stats[person_name] += len(person.get('faces', []))
+                    
+                    if (i + 1) % 5 == 0:  # Progress update every 5 files
+                        print(f"    Progress: {i+1}/{len(processed_assets)} XMP files created")
+            else:
+                print(f"    Warning: Empty XMP content for asset {asset_data.get('file_name', 'Unknown')}")
+        else:
+            print(f"    Warning: No people data for asset {asset_data.get('file_name', 'Unknown')}")
+    
+    # Create summary file
+    summary_file = output_path / "export_summary.json"
+    summary_data = {
+        'export_timestamp': datetime.now().isoformat(),
+        'json_source': json_file_path,
+        'total_assets': len(processed_assets),
+        'total_xmp_files_created': total_files_created,
+        'total_faces_processed': total_faces_processed,
+        'people_statistics': person_stats,
+        'output_directory': str(output_path.absolute())
+    }
+    
+    try:
+        with open(summary_file, 'w', encoding='utf-8') as f:
+            json.dump(summary_data, f, indent=2, ensure_ascii=False)
+    except IOError as e:
+        print(f"Error saving summary file: {e}")
+    
+    print(f"\n✅ DigiKam XMP export completed!")
+    print(f"📊 Statistics:")
+    print(f"   Total assets processed: {len(processed_assets)}")
+    print(f"   XMP sidecar files created: {total_files_created}")
+    print(f"   Total faces processed: {total_faces_processed}")
+    print(f"   Unique people: {len(person_stats)}")
+    print(f"   Output directory: {output_path.absolute()}")
+    print(f"   Summary file: {summary_file}")
+    
+    # Print person statistics
+    if person_stats:
+        print(f"\n👥 People found:")
+        for person, count in sorted(person_stats.items(), key=lambda x: x[1], reverse=True)[:20]:  # Top 20
+            print(f"   {person}: {count} faces")
+    
+    return True
+
+
+def export_faces_to_digikam_xmp(access_token: str, output_dir: str = "xmp_sidecars", max_assets: Optional[int] = None) -> bool:
     """Export face recognition data to DigiKam XMP sidecar files."""
     print("Starting face recognition export to DigiKam XMP format...")
     
@@ -437,7 +598,7 @@ def export_faces_to_digikam_xmp(access_token: str, output_dir: str = "xmp_sideca
     output_path.mkdir(exist_ok=True)
     
     # Process assets with faces
-    processed_assets = process_assets_with_faces(access_token)
+    processed_assets = process_assets_with_faces(access_token, max_assets)
     
     if not processed_assets:
         print("No assets with faces found")
@@ -512,12 +673,102 @@ def export_faces_to_digikam_xmp(access_token: str, output_dir: str = "xmp_sideca
     return True
 
 
+def parse_arguments():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description='Export face recognition data from Immich to DigiKam XMP format',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='''
+Examples:
+  # Run both stages (default): Export to JSON then generate XMP
+  python export_face.py
+  
+  # Run only Stage 1: Export to JSON file
+  python export_face.py --stage1-only
+  
+  # Run only Stage 2: Generate XMP from existing JSON file
+  python export_face.py --stage2-only --json-file path/to/export.json
+  
+  # Specify custom output directories
+  python export_face.py --json-dir my_json_exports --xmp-dir my_xmp_files
+        '''
+    )
+    
+    parser.add_argument(
+        '--stage1-only', 
+        action='store_true',
+        help='Run only Stage 1: Export face data to JSON file'
+    )
+    
+    parser.add_argument(
+        '--stage2-only',
+        action='store_true', 
+        help='Run only Stage 2: Generate XMP files from existing JSON file'
+    )
+    
+    parser.add_argument(
+        '--json-file',
+        type=str,
+        help='Path to JSON file for Stage 2 (required with --stage2-only)'
+    )
+    
+    parser.add_argument(
+        '--json-dir',
+        type=str,
+        default=None,
+        help='Directory for JSON exports (default: from config)'
+    )
+    
+    parser.add_argument(
+        '--xmp-dir',
+        type=str,
+        default=None,
+        help='Directory for XMP output (default: from config)'
+    )
+    
+    parser.add_argument(
+        '--max-assets',
+        type=int,
+        default=None,
+        help='Maximum number of assets to process (for debugging)'
+    )
+    
+    return parser.parse_args()
+
+
 def main():
-    """Main function to export face recognition data to DigiKam XMP format."""
+    """Main function to export face recognition data with two-stage processing."""
+    args = parse_arguments()
+    
+    # Validate argument combinations
+    if args.stage1_only and args.stage2_only:
+        print("❌ Error: Cannot specify both --stage1-only and --stage2-only")
+        return
+    
+    if args.stage2_only and not args.json_file:
+        print("❌ Error: --json-file is required when using --stage2-only")
+        return
+    
     # Print configuration summary
     config.print_config_summary()
     
-    # Validate configuration
+    # Stage 2 only mode - no need for Immich authentication
+    if args.stage2_only:
+        print("Running Stage 2 only: Generate XMP from JSON file")
+        
+        # Use custom XMP directory if specified, otherwise use config
+        xmp_dir = args.xmp_dir or config.get_output_config()['digikam_xmp_dir']
+        
+        success = export_faces_to_digikam_xmp_from_json(args.json_file, xmp_dir)
+        
+        if success:
+            print(f"\n🎉 XMP files generated successfully from JSON!")
+            print(f"   Check the '{xmp_dir}' directory for XMP sidecar files.")
+        else:
+            print("\n❌ Failed to generate XMP files from JSON")
+        return
+    
+    # Stage 1 or both stages - need Immich authentication
     if not config.validate_immich_config():
         return
     
@@ -526,11 +777,17 @@ def main():
     email = immich_config['email']
     password = immich_config['password']
     output_config = config.get_output_config()
-    output_dir = output_config['digikam_xmp_dir']
     
-    print("Starting Immich to DigiKam XMP export...")
+    # Use custom directories if specified, otherwise use config
+    json_dir = args.json_dir or output_config['json_export_dir']
+    xmp_dir = args.xmp_dir or output_config['digikam_xmp_dir']
+    
+    print("Starting Immich face recognition export...")
     print(f"Server: {IMMICH_BASE_URL}")
-    print(f"Output directory: {output_dir}")
+    print(f"JSON output directory: {json_dir}")
+    print(f"XMP output directory: {xmp_dir}")
+    if args.max_assets:
+        print(f"Maximum assets to process: {args.max_assets}")
     
     # Step 1: Authenticate
     access_token = authenticate(email, password)
@@ -540,14 +797,29 @@ def main():
     
     print("✅ Authentication successful")
     
-    # Step 2: Export to DigiKam XMP format
-    success = export_faces_to_digikam_xmp(access_token, output_dir)
+    # Stage 1: Export to JSON
+    json_file_path = export_faces_to_json(access_token, json_dir, args.max_assets)
+    
+    if not json_file_path:
+        print("❌ Failed to export face data to JSON")
+        return
+    
+    if args.stage1_only:
+        print(f"\n🎉 Stage 1 completed successfully!")
+        print(f"   JSON file created: {json_file_path}")
+        print(f"   Use this file with --stage2-only --json-file to generate XMP files later.")
+        return
+    
+    # Stage 2: Generate XMP from JSON
+    print(f"\nProceeding to Stage 2: Generate XMP files from JSON...")
+    success = export_faces_to_digikam_xmp_from_json(json_file_path, xmp_dir)
     
     if success:
-        print(f"\n🎉 Face recognition data exported successfully to DigiKam XMP format!")
-        print(f"   Check the '{output_dir}' directory for XMP sidecar files.")
+        print(f"\n🎉 Both stages completed successfully!")
+        print(f"   JSON export: {json_file_path}")
+        print(f"   XMP files: {xmp_dir}")
     else:
-        print("\n❌ Failed to export face recognition data to XMP format")
+        print("\n❌ Failed to generate XMP files from JSON")
 
 
 if __name__ == "__main__":

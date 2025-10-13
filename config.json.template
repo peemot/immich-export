@@ -9,6 +9,7 @@
     "retry_attempts": 3
   },
   "output": {
-    "digikam_xmp_dir": "digikam_xmp_sidecars"
+    "digikam_xmp_dir": "digikam_xmp_sidecars",
+    "json_export_dir": "json_exports"
   }
 }
