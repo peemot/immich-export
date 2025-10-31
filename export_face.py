@@ -267,14 +267,64 @@ def get_asset_with_faces(access_token: str, asset_id: str) -> Optional[Dict[str,
 
 
 def create_digikam_xmp_content(asset_data: Dict[str, Any]) -> str:
-    """Create DigiKam-compatible XMP content for face recognition data."""
+    """Create DigiKam-compatible XMP content for face recognition data with EXIF information."""
     
     # Get people data from asset
     people = asset_data.get('people', [])
+    exif_info = asset_data.get('exifInfo', {})
+    
     if not people:
         return ""
     
-    # XMP header
+    # Extract EXIF data
+    def safe_get_exif(key, default=""):
+        return str(exif_info.get(key, default)) if exif_info.get(key) is not None else default
+    
+    # Format dates for XMP
+    def format_xmp_date(date_str):
+        if not date_str:
+            return ""
+        try:
+            # Try to parse common date formats
+            if 'T' in date_str:
+                return date_str
+            else:
+                # Add time if only date
+                return f"{date_str}T12:00:00"
+        except:
+            return date_str
+    
+    # Get camera information
+    make = safe_get_exif('make')
+    model = safe_get_exif('model')
+    lens_model = safe_get_exif('lensModel')
+    
+    # Get exposure settings
+    f_number = safe_get_exif('fNumber')
+    exposure_time = safe_get_exif('exposureTime')
+    iso = safe_get_exif('iso')
+    focal_length = safe_get_exif('focalLength')
+    
+    # Get image dimensions
+    image_width = safe_get_exif('exifImageWidth', '2160')
+    image_height = safe_get_exif('exifImageHeight', '1440')
+    
+    # Get location information
+    latitude = safe_get_exif('latitude')
+    longitude = safe_get_exif('longitude')
+    city = safe_get_exif('city')
+    state = safe_get_exif('state')
+    country = safe_get_exif('country')
+    
+    # Get dates
+    date_original = format_xmp_date(safe_get_exif('dateTimeOriginal'))
+    date_digitized = format_xmp_date(safe_get_exif('dateTimeDigitized'))
+    
+    # Get file info
+    file_name = asset_data.get('file_name', '')
+    original_path = asset_data.get('original_path', '')
+    
+    # XMP header with comprehensive namespaces
     xmp_content = f'''<?xml version="1.0" encoding="UTF-8"?>
 <x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="XMP Core 4.4.0">
  <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
@@ -283,12 +333,88 @@ def create_digikam_xmp_content(asset_data: Dict[str, Any]) -> str:
    xmlns:dc="http://purl.org/dc/elements/1.1/"
    xmlns:xmp="http://ns.adobe.com/xap/1.0/"
    xmlns:xmpMM="http://ns.adobe.com/xap/1.0/mm/"
+   xmlns:exif="http://ns.adobe.com/exif/1.0/"
+   xmlns:tiff="http://ns.adobe.com/tiff/1.0/"
+   xmlns:photoshop="http://ns.adobe.com/photoshop/1.0/"
+   xmlns:Iptc4xmpCore="http://iptc.org/std/Iptc4xmpCore/1.0/xmlns/"
    xmlns:stDim="http://ns.adobe.com/xap/1.0/sType/Dimensions#"
    xmlns:stArea="http://ns.adobe.com/xap/1.0/sType/Area#"
    mwg-rs:Regions=""
    xmp:ModifyDate="{datetime.now().strftime('%Y-%m-%dT%H:%M:%S')}"
    xmp:MetadataDate="{datetime.now().strftime('%Y-%m-%dT%H:%M:%S')}">
-   <mwg-rs:Regions>
+'''
+    
+    # Add EXIF and TIFF information
+    if make or model:
+        xmp_content += f'''   <tiff:Make>{make}</tiff:Make>
+   <tiff:Model>{model}</tiff:Model>
+'''
+    
+    if lens_model:
+        xmp_content += f'''   <exif:LensModel>{lens_model}</exif:LensModel>
+'''
+    
+    # Add exposure settings
+    if f_number:
+        xmp_content += f'''   <exif:FNumber>{f_number}</exif:FNumber>
+'''
+    if exposure_time:
+        xmp_content += f'''   <exif:ExposureTime>{exposure_time}</exif:ExposureTime>
+'''
+    if iso:
+        xmp_content += f'''   <exif:ISOSpeedRatings>{iso}</exif:ISOSpeedRatings>
+'''
+    if focal_length:
+        xmp_content += f'''   <exif:FocalLength>{focal_length}</exif:FocalLength>
+'''
+    
+    # Add image dimensions
+    if image_width and image_height:
+        xmp_content += f'''   <tiff:ImageWidth>{image_width}</tiff:ImageWidth>
+   <tiff:ImageLength>{image_height}</tiff:ImageLength>
+   <exif:ExifImageWidth>{image_width}</exif:ExifImageWidth>
+   <exif:ExifImageHeight>{image_height}</exif:ExifImageHeight>
+'''
+    
+    # Add dates
+    if date_original:
+        xmp_content += f'''   <exif:DateTimeOriginal>{date_original}</exif:DateTimeOriginal>
+'''
+    if date_digitized:
+        xmp_content += f'''   <exif:DateTimeDigitized>{date_digitized}</exif:DateTimeDigitized>
+'''
+    
+    # Add location information
+    if latitude and longitude:
+        xmp_content += f'''   <exif:GPSLatitude>{latitude}</exif:GPSLatitude>
+   <exif:GPSLongitude>{longitude}</exif:GPSLongitude>
+'''
+    
+    # Add location names
+    if city:
+        xmp_content += f'''   <photoshop:City>{city}</photoshop:City>
+'''
+    if state:
+        xmp_content += f'''   <photoshop:State>{state}</photoshop:State>
+'''
+    if country:
+        xmp_content += f'''   <photoshop:Country>{country}</photoshop:Country>
+'''
+    
+    # Add file information
+    if file_name:
+        xmp_content += f'''   <xmp:Identifier>{file_name}</xmp:Identifier>
+'''
+    if original_path:
+        xmp_content += f'''   <xmp:BaseURL>{original_path}</xmp:BaseURL>
+'''
+    
+    # Add software and creation info
+    xmp_content += f'''   <xmp:CreatorTool>Immich Face Export Script</xmp:CreatorTool>
+'''
+    
+    # Start face regions
+    xmp_content += '''   <mwg-rs:Regions>
     <rdf:Bag>
 '''
     
@@ -310,8 +436,8 @@ def create_digikam_xmp_content(asset_data: Dict[str, Any]) -> str:
             
             # Get image dimensions for normalization
             exif_info = asset_data.get('exifInfo', {})
-            image_width = exif_info.get('exifImageWidth', 2160)
-            image_height = exif_info.get('exifImageHeight', 1440)
+            image_width = int(exif_info.get('exifImageWidth', 2160))
+            image_height = int(exif_info.get('exifImageHeight', 1440))
             
             # Normalize coordinates (0-1 range)
             norm_x = center_x / image_width if image_width > 0 else 0
