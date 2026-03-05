@@ -266,6 +266,80 @@ def get_asset_with_faces(access_token: str, asset_id: str) -> Optional[Dict[str,
         return None
 
 
+def _parse_orientation(orientation) -> int:
+    """Parse Exif orientation strings or ints into a standard integer 1-8."""
+    if isinstance(orientation, int):
+        return orientation
+        
+    if isinstance(orientation, str):
+        o_lower = str(orientation).lower()
+        if any(x in o_lower for x in['6', 'right top', 'right-top', '90 cw']):
+            return 6
+        elif any(x in o_lower for x in['8', 'left bottom', 'left-bottom', '270 cw']):
+            return 8
+        elif any(x in o_lower for x in['3', 'bottom right', '180']):
+            return 3
+        elif any(x in o_lower for x in['2', 'top right', 'mirror horizontal']):
+            return 2
+        elif any(x in o_lower for x in ['4', 'bottom left', 'mirror vertical']):
+            return 4
+        elif '5' in o_lower:
+            return 5
+        elif '7' in o_lower:
+            return 7
+            
+    return 1
+
+
+def _calculate_unrotated_face_coords(face: Dict[str, Any], orientation_val: int, raw_w: int, raw_h: int):
+    """Transform Immich visual face coordinates back to raw unrotated space for DigiKam."""
+    ml_w = face.get('imageWidth')
+    ml_h = face.get('imageHeight')
+
+    # Fallback to visually rotated dimensions if ml_w/ml_h is missing
+    if not ml_w or not ml_h:
+        is_sideways = orientation_val in [5, 6, 7, 8]
+        ml_w, ml_h = (raw_h, raw_w) if is_sideways else (raw_w, raw_h)
+
+    # Normalize coordinates relative to the ML canvas (Visual Space)
+    vis_x1 = face.get('boundingBoxX1', 0) / ml_w if ml_w else 0
+    vis_y1 = face.get('boundingBoxY1', 0) / ml_h if ml_h else 0
+    vis_x2 = face.get('boundingBoxX2', 0) / ml_w if ml_w else 0
+    vis_y2 = face.get('boundingBoxY2', 0) / ml_h if ml_h else 0
+
+    # Calculate Center and Size in Visual Space
+    vis_cx = (vis_x1 + vis_x2) / 2.0
+    vis_cy = (vis_y1 + vis_y2) / 2.0
+    vis_fw = abs(vis_x2 - vis_x1)
+    vis_fh = abs(vis_y2 - vis_y1)
+
+    # --- INVERSE TRANSFORMATION ---
+    raw_cx, raw_cy = vis_cx, vis_cy
+    raw_fw, raw_fh = vis_fw, vis_fh
+
+    if orientation_val == 2:    # Mirror horizontal
+        raw_cx = 1.0 - vis_cx
+    elif orientation_val == 3:  # Rotate 180
+        raw_cx = 1.0 - vis_cx
+        raw_cy = 1.0 - vis_cy
+    elif orientation_val == 4:  # Mirror vertical
+        raw_cy = 1.0 - vis_cy
+    elif orientation_val == 5:  # Mirror horizontal and rotate 270 CW
+        raw_cx, raw_cy = vis_cy, vis_cx
+        raw_fw, raw_fh = vis_fh, vis_fw
+    elif orientation_val == 6:  # Rotate 90 CW (Standard Portrait)
+        raw_cx, raw_cy = vis_cy, 1.0 - vis_cx
+        raw_fw, raw_fh = vis_fh, vis_fw
+    elif orientation_val == 7:  # Mirror horizontal and rotate 90 CW
+        raw_cx, raw_cy = 1.0 - vis_cy, 1.0 - vis_cx
+        raw_fw, raw_fh = vis_fh, vis_fw
+    elif orientation_val == 8:  # Rotate 270 CW (Inverse Portrait)
+        raw_cx, raw_cy = 1.0 - vis_cy, vis_cx
+        raw_fw, raw_fh = vis_fh, vis_fw
+
+    return raw_cx, raw_cy, raw_fw, raw_fh
+
+
 def create_digikam_xmp_content(asset_data: Dict[str, Any]) -> str:
     """Create DigiKam-compatible XMP content for face recognition data with EXIF information."""
     
@@ -276,23 +350,13 @@ def create_digikam_xmp_content(asset_data: Dict[str, Any]) -> str:
     if not people:
         return ""
     
-    # Extract EXIF data
+    # Helper functions for data extraction
     def safe_get_exif(key, default=""):
         return str(exif_info.get(key, default)) if exif_info.get(key) is not None else default
     
-    # Format dates for XMP
     def format_xmp_date(date_str):
-        if not date_str:
-            return ""
-        try:
-            # Try to parse common date formats
-            if 'T' in date_str:
-                return date_str
-            else:
-                # Add time if only date
-                return f"{date_str}T12:00:00"
-        except:
-            return date_str
+        if not date_str: return ""
+        return date_str if 'T' in date_str else f"{date_str}T12:00:00"
     
     # Get camera information
     make = safe_get_exif('make')
@@ -309,29 +373,7 @@ def create_digikam_xmp_content(asset_data: Dict[str, Any]) -> str:
     # It's crucial to prioritize exifImageWidth/Height as they represent the UNROTATED raw dimensions.
     raw_w = int(exif_info.get('exifImageWidth') or asset_data.get('width') or 0)
     raw_h = int(exif_info.get('exifImageHeight') or asset_data.get('height') or 0)
-    
-    # Get image orientation
-    orientation = exif_info.get('orientation')
-    orientation_val = 1
-    
-    if isinstance(orientation, str):
-        o_lower = str(orientation).lower()
-        if any(x in o_lower for x in['6', 'right top', 'right-top', '90 cw']):
-            orientation_val = 6
-        elif any(x in o_lower for x in['8', 'left bottom', 'left-bottom', '270 cw']):
-            orientation_val = 8
-        elif any(x in o_lower for x in ['3', 'bottom right', '180']):
-            orientation_val = 3
-        elif any(x in o_lower for x in ['2', 'top right', 'mirror horizontal']):
-            orientation_val = 2
-        elif any(x in o_lower for x in['4', 'bottom left', 'mirror vertical']):
-            orientation_val = 4
-        elif '5' in o_lower:
-            orientation_val = 5
-        elif '7' in o_lower:
-            orientation_val = 7
-    elif isinstance(orientation, int):
-        orientation_val = orientation
+    orientation_val = _parse_orientation(exif_info.get('orientation'))
     
     # Get location information
     latitude = safe_get_exif('latitude')
@@ -346,7 +388,6 @@ def create_digikam_xmp_content(asset_data: Dict[str, Any]) -> str:
     
     # Get file info
     file_name = asset_data.get('file_name', '')
-    original_path = asset_data.get('original_path', '')
     
     # XMP header with comprehensive namespaces
     xmp_content = f'''<?xml version="1.0" encoding="UTF-8"?>
@@ -428,12 +469,9 @@ def create_digikam_xmp_content(asset_data: Dict[str, Any]) -> str:
     if file_name:
         xmp_content += f'''   <xmp:Identifier>{file_name}</xmp:Identifier>
 '''
-    if original_path:
-        xmp_content += f'''   <xmp:BaseURL>{original_path}</xmp:BaseURL>
-'''
     
     # Add software and creation info
-    xmp_content += f'''   <xmp:CreatorTool>Immich Face Export Script</xmp:CreatorTool>
+    xmp_content += f'''   <xmp:CreatorTool>Immich Face Export Tool</xmp:CreatorTool>
 '''
     
     # Add people tags for general compatibility
@@ -464,65 +502,18 @@ def create_digikam_xmp_content(asset_data: Dict[str, Any]) -> str:
     <rdf:Bag>
 '''
 
-    # Process faces using THEIR OWN internal dimensions
+    # Populate Face Regions
     for person in people:
-        person_name = person.get('name', 'Unknown')
-        for face in person.get('faces',[]):
-            ml_w = face.get('imageWidth')
-            ml_h = face.get('imageHeight')
-
-            # Fallback to visually rotated dimensions if ml_w/ml_h is missing, 
-            # as Immich's bounding boxes are relative to the upright display state
-            if not ml_w or not ml_h:
-                is_sideways = orientation_val in[5, 6, 7, 8]
-                ml_w, ml_h = (raw_h, raw_w) if is_sideways else (raw_w, raw_h)
-
-            # Raw bounding box coordinates from Immich (these are Visual/Upright Space)
-            x1 = face.get('boundingBoxX1', 0)
-            y1 = face.get('boundingBoxY1', 0)
-            x2 = face.get('boundingBoxX2', 0)
-            y2 = face.get('boundingBoxY2', 0)
-
-            # Normalize coordinates relative to the ML canvas (Visual Space)
-            vis_x1 = x1 / ml_w if ml_w else 0
-            vis_y1 = y1 / ml_h if ml_h else 0
-            vis_x2 = x2 / ml_w if ml_w else 0
-            vis_y2 = y2 / ml_h if ml_h else 0
-
-            # Calculate Center and Size in Visual Space
-            vis_cx = (vis_x1 + vis_x2) / 2.0
-            vis_cy = (vis_y1 + vis_y2) / 2.0
-            vis_fw = abs(vis_x2 - vis_x1)
-            vis_fh = abs(vis_y2 - vis_y1)
-
-            # --- INVERSE TRANSFORMATION ---
-            # Transform Visual Space coordinates back to RAW Unrotated Space for DigiKam
-            raw_cx, raw_cy = vis_cx, vis_cy
-            raw_fw, raw_fh = vis_fw, vis_fh
-
-            if orientation_val == 2:    # Mirror horizontal
-                raw_cx = 1.0 - vis_cx
-            elif orientation_val == 3:  # Rotate 180
-                raw_cx = 1.0 - vis_cx
-                raw_cy = 1.0 - vis_cy
-            elif orientation_val == 4:  # Mirror vertical
-                raw_cy = 1.0 - vis_cy
-            elif orientation_val == 5:  # Mirror horizontal and rotate 270 CW
-                raw_cx = vis_cy
-                raw_cy = vis_cx
-                raw_fw, raw_fh = vis_fh, vis_fw
-            elif orientation_val == 6:  # Rotate 90 CW (Standard Portrait)
-                raw_cx = vis_cy
-                raw_cy = 1.0 - vis_cx
-                raw_fw, raw_fh = vis_fh, vis_fw
-            elif orientation_val == 7:  # Mirror horizontal and rotate 90 CW
-                raw_cx = 1.0 - vis_cy
-                raw_cy = 1.0 - vis_cx
-                raw_fw, raw_fh = vis_fh, vis_fw
-            elif orientation_val == 8:  # Rotate 270 CW (Inverse Portrait)
-                raw_cx = 1.0 - vis_cy
-                raw_cy = vis_cx
-                raw_fw, raw_fh = vis_fh, vis_fw
+        person_name = person.get("name", "Unknown")
+        
+        face_list = person.get("faces")
+        if not face_list:
+            continue
+            
+        for face in face_list:
+            raw_cx, raw_cy, raw_fw, raw_fh = _calculate_unrotated_face_coords(
+                face, orientation_val, raw_w, raw_h
+            )
 
             xmp_content += f'''     <rdf:li>
       <rdf:Description
