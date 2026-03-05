@@ -306,8 +306,32 @@ def create_digikam_xmp_content(asset_data: Dict[str, Any]) -> str:
     focal_length = safe_get_exif('focalLength')
     
     # Get image dimensions
-    image_width = safe_get_exif('exifImageWidth', '2160')
-    image_height = safe_get_exif('exifImageHeight', '1440')
+    # It's crucial to prioritize exifImageWidth/Height as they represent the UNROTATED raw dimensions.
+    raw_w = int(exif_info.get('exifImageWidth') or asset_data.get('width') or 0)
+    raw_h = int(exif_info.get('exifImageHeight') or asset_data.get('height') or 0)
+    
+    # Get image orientation
+    orientation = exif_info.get('orientation')
+    orientation_val = 1
+    
+    if isinstance(orientation, str):
+        o_lower = str(orientation).lower()
+        if any(x in o_lower for x in['6', 'right top', 'right-top', '90 cw']):
+            orientation_val = 6
+        elif any(x in o_lower for x in['8', 'left bottom', 'left-bottom', '270 cw']):
+            orientation_val = 8
+        elif any(x in o_lower for x in ['3', 'bottom right', '180']):
+            orientation_val = 3
+        elif any(x in o_lower for x in ['2', 'top right', 'mirror horizontal']):
+            orientation_val = 2
+        elif any(x in o_lower for x in['4', 'bottom left', 'mirror vertical']):
+            orientation_val = 4
+        elif '5' in o_lower:
+            orientation_val = 5
+        elif '7' in o_lower:
+            orientation_val = 7
+    elif isinstance(orientation, int):
+        orientation_val = orientation
     
     # Get location information
     latitude = safe_get_exif('latitude')
@@ -367,11 +391,12 @@ def create_digikam_xmp_content(asset_data: Dict[str, Any]) -> str:
 '''
     
     # Add image dimensions
-    if image_width and image_height:
-        xmp_content += f'''   <tiff:ImageWidth>{image_width}</tiff:ImageWidth>
-   <tiff:ImageLength>{image_height}</tiff:ImageLength>
-   <exif:ExifImageWidth>{image_width}</exif:ExifImageWidth>
-   <exif:ExifImageHeight>{image_height}</exif:ExifImageHeight>
+    # MWG Spec dictates regions must be relative to the UNROTATED image data.
+    if raw_w and raw_h:
+        xmp_content += f'''   <tiff:ImageWidth>{raw_w}</tiff:ImageWidth>
+   <tiff:ImageLength>{raw_h}</tiff:ImageLength>
+   <exif:ExifImageWidth>{raw_w}</exif:ExifImageWidth>
+   <exif:ExifImageHeight>{raw_h}</exif:ExifImageHeight>
 '''
     
     # Add dates
@@ -429,58 +454,89 @@ def create_digikam_xmp_content(asset_data: Dict[str, Any]) -> str:
    </dc:subject>
 '''
     
-    # Start face regions
+    # Add AppliedToDimensions
     xmp_content += f'''   <mwg-rs:Regions rdf:parseType="Resource">
     <mwg-rs:AppliedToDimensions
-     stDim:w="{image_width}"
-     stDim:h="{image_height}"
+     stDim:w="{raw_w}"
+     stDim:h="{raw_h}"
      stDim:unit="pixel"/>
     <mwg-rs:RegionList>
     <rdf:Bag>
 '''
-    
-    # Add face regions from people data
+
+    # Process faces using THEIR OWN internal dimensions
     for person in people:
         person_name = person.get('name', 'Unknown')
-        for face in person.get('faces', []):
-            # Convert bounding box to XMP format (normalized coordinates)
+        for face in person.get('faces',[]):
+            ml_w = face.get('imageWidth')
+            ml_h = face.get('imageHeight')
+
+            # Fallback to visually rotated dimensions if ml_w/ml_h is missing, 
+            # as Immich's bounding boxes are relative to the upright display state
+            if not ml_w or not ml_h:
+                is_sideways = orientation_val in[5, 6, 7, 8]
+                ml_w, ml_h = (raw_h, raw_w) if is_sideways else (raw_w, raw_h)
+
+            # Raw bounding box coordinates from Immich (these are Visual/Upright Space)
             x1 = face.get('boundingBoxX1', 0)
             y1 = face.get('boundingBoxY1', 0)
             x2 = face.get('boundingBoxX2', 0)
             y2 = face.get('boundingBoxY2', 0)
-            
-            # Calculate center and dimensions
-            width = x2 - x1
-            height = y2 - y1
-            center_x = x1 + width / 2
-            center_y = y1 + height / 2
-            
-            # Get image dimensions for normalization
-            exif_info = asset_data.get('exifInfo', {})
-            image_width = int(exif_info.get('exifImageWidth', 2160))
-            image_height = int(exif_info.get('exifImageHeight', 1440))
-            
-            # Normalize coordinates (0-1 range)
-            norm_x = center_x / image_width if image_width > 0 else 0
-            norm_y = center_y / image_height if image_height > 0 else 0
-            norm_w = width / image_width if image_width > 0 else 0
-            norm_h = height / image_height if image_height > 0 else 0
-            
-            # XMP region format
-            region_xml = f'''     <rdf:li>
+
+            # Normalize coordinates relative to the ML canvas (Visual Space)
+            vis_x1 = x1 / ml_w if ml_w else 0
+            vis_y1 = y1 / ml_h if ml_h else 0
+            vis_x2 = x2 / ml_w if ml_w else 0
+            vis_y2 = y2 / ml_h if ml_h else 0
+
+            # Calculate Center and Size in Visual Space
+            vis_cx = (vis_x1 + vis_x2) / 2.0
+            vis_cy = (vis_y1 + vis_y2) / 2.0
+            vis_fw = abs(vis_x2 - vis_x1)
+            vis_fh = abs(vis_y2 - vis_y1)
+
+            # --- INVERSE TRANSFORMATION ---
+            # Transform Visual Space coordinates back to RAW Unrotated Space for DigiKam
+            raw_cx, raw_cy = vis_cx, vis_cy
+            raw_fw, raw_fh = vis_fw, vis_fh
+
+            if orientation_val == 2:    # Mirror horizontal
+                raw_cx = 1.0 - vis_cx
+            elif orientation_val == 3:  # Rotate 180
+                raw_cx = 1.0 - vis_cx
+                raw_cy = 1.0 - vis_cy
+            elif orientation_val == 4:  # Mirror vertical
+                raw_cy = 1.0 - vis_cy
+            elif orientation_val == 5:  # Mirror horizontal and rotate 270 CW
+                raw_cx = vis_cy
+                raw_cy = vis_cx
+                raw_fw, raw_fh = vis_fh, vis_fw
+            elif orientation_val == 6:  # Rotate 90 CW (Standard Portrait)
+                raw_cx = vis_cy
+                raw_cy = 1.0 - vis_cx
+                raw_fw, raw_fh = vis_fh, vis_fw
+            elif orientation_val == 7:  # Mirror horizontal and rotate 90 CW
+                raw_cx = 1.0 - vis_cy
+                raw_cy = 1.0 - vis_cx
+                raw_fw, raw_fh = vis_fh, vis_fw
+            elif orientation_val == 8:  # Rotate 270 CW (Inverse Portrait)
+                raw_cx = 1.0 - vis_cy
+                raw_cy = vis_cx
+                raw_fw, raw_fh = vis_fh, vis_fw
+
+            xmp_content += f'''     <rdf:li>
       <rdf:Description
        mwg-rs:Name="{person_name}"
        mwg-rs:Type="Face">
        <mwg-rs:Area
-        stArea:x="{norm_x:.6f}"
-        stArea:y="{norm_y:.6f}"
-        stArea:w="{norm_w:.6f}"
-        stArea:h="{norm_h:.6f}"
+        stArea:x="{raw_cx:.6f}"
+        stArea:y="{raw_cy:.6f}"
+        stArea:w="{raw_fw:.6f}"
+        stArea:h="{raw_fh:.6f}"
         stArea:unit="normalized"/>
       </rdf:Description>
      </rdf:li>
 '''
-            xmp_content += region_xml
     
     # XMP footer
     xmp_content += '''    </rdf:Bag>
