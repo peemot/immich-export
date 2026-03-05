@@ -338,8 +338,7 @@ def create_digikam_xmp_content(asset_data: Dict[str, Any]) -> str:
    xmlns:photoshop="http://ns.adobe.com/photoshop/1.0/"
    xmlns:Iptc4xmpCore="http://iptc.org/std/Iptc4xmpCore/1.0/xmlns/"
    xmlns:stDim="http://ns.adobe.com/xap/1.0/sType/Dimensions#"
-   xmlns:stArea="http://ns.adobe.com/xap/1.0/sType/Area#"
-   mwg-rs:Regions=""
+   xmlns:stArea="http://ns.adobe.com/xmp/sType/Area#"
    xmp:ModifyDate="{datetime.now().strftime('%Y-%m-%dT%H:%M:%S')}"
    xmp:MetadataDate="{datetime.now().strftime('%Y-%m-%dT%H:%M:%S')}">
 '''
@@ -349,7 +348,6 @@ def create_digikam_xmp_content(asset_data: Dict[str, Any]) -> str:
         xmp_content += f'''   <tiff:Make>{make}</tiff:Make>
    <tiff:Model>{model}</tiff:Model>
 '''
-    
     if lens_model:
         xmp_content += f'''   <exif:LensModel>{lens_model}</exif:LensModel>
 '''
@@ -432,7 +430,12 @@ def create_digikam_xmp_content(asset_data: Dict[str, Any]) -> str:
 '''
     
     # Start face regions
-    xmp_content += '''   <mwg-rs:Regions>
+    xmp_content += f'''   <mwg-rs:Regions rdf:parseType="Resource">
+    <mwg-rs:AppliedToDimensions
+     stDim:w="{image_width}"
+     stDim:h="{image_height}"
+     stDim:unit="pixel"/>
+    <mwg-rs:RegionList>
     <rdf:Bag>
 '''
     
@@ -467,8 +470,7 @@ def create_digikam_xmp_content(asset_data: Dict[str, Any]) -> str:
             region_xml = f'''     <rdf:li>
       <rdf:Description
        mwg-rs:Name="{person_name}"
-       mwg-rs:Type="Face"
-       mwg-rs:Extensions="">
+       mwg-rs:Type="Face">
        <mwg-rs:Area
         stArea:x="{norm_x:.6f}"
         stArea:y="{norm_y:.6f}"
@@ -482,6 +484,7 @@ def create_digikam_xmp_content(asset_data: Dict[str, Any]) -> str:
     
     # XMP footer
     xmp_content += '''    </rdf:Bag>
+    </mwg-rs:RegionList>
    </mwg-rs:Regions>
   </rdf:Description>
  </rdf:RDF>
