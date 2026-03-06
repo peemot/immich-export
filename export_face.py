@@ -13,6 +13,7 @@ import argparse
 from typing import Dict, Any, Optional, List
 from datetime import datetime
 from pathlib import Path
+from xml.sax.saxutils import escape as _xml_escape
 
 
 class ConfigLoader:
@@ -342,203 +343,164 @@ def _calculate_unrotated_face_coords(face: Dict[str, Any], orientation_val: int,
 
 def create_digikam_xmp_content(asset_data: Dict[str, Any]) -> str:
     """Create DigiKam-compatible XMP content for face recognition data with EXIF information."""
-    
-    # Get people data from asset
-    people = asset_data.get('people', [])
-    exif_info = asset_data.get('exifInfo', {})
-    
+
+    people = asset_data.get("people") or []
     if not people:
         return ""
-    
-    # Helper functions for data extraction
-    def safe_get_exif(key, default=""):
-        return str(exif_info.get(key, default)) if exif_info.get(key) is not None else default
-    
-    def format_xmp_date(date_str):
-        if not date_str: return ""
-        return date_str if 'T' in date_str else f"{date_str}T12:00:00"
-    
-    # Get camera information
-    make = safe_get_exif('make')
-    model = safe_get_exif('model')
-    lens_model = safe_get_exif('lensModel')
-    
-    # Get exposure settings
-    f_number = safe_get_exif('fNumber')
-    exposure_time = safe_get_exif('exposureTime')
-    iso = safe_get_exif('iso')
-    focal_length = safe_get_exif('focalLength')
-    
-    # Get image dimensions
-    # It's crucial to prioritize exifImageWidth/Height as they represent the UNROTATED raw dimensions.
-    raw_w = int(exif_info.get('exifImageWidth') or asset_data.get('width') or 0)
-    raw_h = int(exif_info.get('exifImageHeight') or asset_data.get('height') or 0)
-    orientation_val = _parse_orientation(exif_info.get('orientation'))
-    
-    # Get location information
-    latitude = safe_get_exif('latitude')
-    longitude = safe_get_exif('longitude')
-    city = safe_get_exif('city')
-    state = safe_get_exif('state')
-    country = safe_get_exif('country')
-    
-    # Get dates
-    date_original = format_xmp_date(safe_get_exif('dateTimeOriginal'))
-    date_digitized = format_xmp_date(safe_get_exif('dateTimeDigitized'))
-    
-    # Get file info
-    file_name = asset_data.get('file_name', '')
-    
-    # XMP header with comprehensive namespaces
-    xmp_content = f'''<?xml version="1.0" encoding="UTF-8"?>
-<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="XMP Core 4.4.0">
- <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
-  <rdf:Description rdf:about=""
-   xmlns:mwg-rs="http://www.metadataworkinggroup.com/schemas/regions/"
-   xmlns:dc="http://purl.org/dc/elements/1.1/"
-   xmlns:xmp="http://ns.adobe.com/xap/1.0/"
-   xmlns:xmpMM="http://ns.adobe.com/xap/1.0/mm/"
-   xmlns:exif="http://ns.adobe.com/exif/1.0/"
-   xmlns:tiff="http://ns.adobe.com/tiff/1.0/"
-   xmlns:photoshop="http://ns.adobe.com/photoshop/1.0/"
-   xmlns:Iptc4xmpCore="http://iptc.org/std/Iptc4xmpCore/1.0/xmlns/"
-   xmlns:stDim="http://ns.adobe.com/xap/1.0/sType/Dimensions#"
-   xmlns:stArea="http://ns.adobe.com/xmp/sType/Area#"
-   xmp:ModifyDate="{datetime.now().strftime('%Y-%m-%dT%H:%M:%S')}"
-   xmp:MetadataDate="{datetime.now().strftime('%Y-%m-%dT%H:%M:%S')}">
-'''
-    
-    # Add EXIF and TIFF information
-    if make or model:
-        xmp_content += f'''   <tiff:Make>{make}</tiff:Make>
-   <tiff:Model>{model}</tiff:Model>
-'''
-    if lens_model:
-        xmp_content += f'''   <exif:LensModel>{lens_model}</exif:LensModel>
-'''
-    
-    # Add exposure settings
-    if f_number:
-        xmp_content += f'''   <exif:FNumber>{f_number}</exif:FNumber>
-'''
-    if exposure_time:
-        xmp_content += f'''   <exif:ExposureTime>{exposure_time}</exif:ExposureTime>
-'''
-    if iso:
-        xmp_content += f'''   <exif:ISOSpeedRatings>{iso}</exif:ISOSpeedRatings>
-'''
-    if focal_length:
-        xmp_content += f'''   <exif:FocalLength>{focal_length}</exif:FocalLength>
-'''
-    
-    # Add image dimensions
-    # MWG Spec dictates regions must be relative to the UNROTATED image data.
+
+    exif_info = asset_data.get("exifInfo") or {}
+    now = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+
+    def xml_text(value: Any) -> str:
+        """Escape text for safe XML embedding (also safe for attribute values)."""
+        if value is None:
+            return ""
+        return _xml_escape(str(value), {'"': "&quot;", "'": "&apos;"})
+
+    def exif_str(key: str, default: str = "") -> str:
+        """Read EXIF value as string; returns default/empty for None."""
+        val = exif_info.get(key, default)
+        return "" if val is None else str(val)
+
+    def xmp_date(date_str: str) -> str:
+        """Ensure XMP date-time format (adds a dummy time if only date is present)."""
+        if not date_str:
+            return ""
+        return date_str if "T" in date_str else f"{date_str}T12:00:00"
+
+    def add_tag(lines: List[str], ns_tag: str, value: str, *, allow_empty: bool = False) -> None:
+        """Append a simple <ns:Tag>value</ns:Tag> if value exists (or allow_empty)."""
+        if value or allow_empty:
+            lines.append(f"   <{ns_tag}>{xml_text(value)}</{ns_tag}>")
+
+    # MWG regions must be relative to the UNROTATED (raw) image dimensions.
+    raw_w = int(exif_info.get("exifImageWidth") or asset_data.get("width") or 0)
+    raw_h = int(exif_info.get("exifImageHeight") or asset_data.get("height") or 0)
+    orientation_val = _parse_orientation(exif_info.get("orientation"))
+
+    lines: List[str] = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="XMP Core 4.4.0">',
+        ' <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">',
+        '  <rdf:Description rdf:about=""',
+        '   xmlns:mwg-rs="http://www.metadataworkinggroup.com/schemas/regions/"',
+        '   xmlns:dc="http://purl.org/dc/elements/1.1/"',
+        '   xmlns:xmp="http://ns.adobe.com/xap/1.0/"',
+        '   xmlns:xmpMM="http://ns.adobe.com/xap/1.0/mm/"',
+        '   xmlns:exif="http://ns.adobe.com/exif/1.0/"',
+        '   xmlns:tiff="http://ns.adobe.com/tiff/1.0/"',
+        '   xmlns:photoshop="http://ns.adobe.com/photoshop/1.0/"',
+        '   xmlns:Iptc4xmpCore="http://iptc.org/std/Iptc4xmpCore/1.0/xmlns/"',
+        '   xmlns:stDim="http://ns.adobe.com/xap/1.0/sType/Dimensions#"',
+        '   xmlns:stArea="http://ns.adobe.com/xmp/sType/Area#"',
+        f'   xmp:ModifyDate="{now}"',
+        f'   xmp:MetadataDate="{now}">',
+    ]
+
+    # --- EXIF / TIFF (camera + lens) ---
+    add_tag(lines, "tiff:Make", exif_str("make"))
+    add_tag(lines, "tiff:Model", exif_str("model"))
+    add_tag(lines, "exif:LensModel", exif_str("lensModel"))
+
+    # --- Exposure settings ---
+    add_tag(lines, "exif:FNumber", exif_str("fNumber"))
+    add_tag(lines, "exif:ExposureTime", exif_str("exposureTime"))
+    add_tag(lines, "exif:ISOSpeedRatings", exif_str("iso"))
+    add_tag(lines, "exif:FocalLength", exif_str("focalLength"))
+
+    # --- Image dimensions (raw / unrotated) ---
     if raw_w and raw_h:
-        xmp_content += f'''   <tiff:ImageWidth>{raw_w}</tiff:ImageWidth>
-   <tiff:ImageLength>{raw_h}</tiff:ImageLength>
-   <exif:ExifImageWidth>{raw_w}</exif:ExifImageWidth>
-   <exif:ExifImageHeight>{raw_h}</exif:ExifImageHeight>
-'''
-    
-    # Add dates
-    if date_original:
-        xmp_content += f'''   <exif:DateTimeOriginal>{date_original}</exif:DateTimeOriginal>
-'''
-    if date_digitized:
-        xmp_content += f'''   <exif:DateTimeDigitized>{date_digitized}</exif:DateTimeDigitized>
-'''
-    
-    # Add location information
+        add_tag(lines, "tiff:ImageWidth", str(raw_w))
+        add_tag(lines, "tiff:ImageLength", str(raw_h))
+        add_tag(lines, "exif:ExifImageWidth", str(raw_w))
+        add_tag(lines, "exif:ExifImageHeight", str(raw_h))
+
+    # --- Dates ---
+    add_tag(lines, "exif:DateTimeOriginal", xmp_date(exif_str("dateTimeOriginal")))
+    add_tag(lines, "exif:DateTimeDigitized", xmp_date(exif_str("dateTimeDigitized")))
+
+    # --- GPS + place names ---
+    latitude = exif_str("latitude")
+    longitude = exif_str("longitude")
     if latitude and longitude:
-        xmp_content += f'''   <exif:GPSLatitude>{latitude}</exif:GPSLatitude>
-   <exif:GPSLongitude>{longitude}</exif:GPSLongitude>
-'''
-    
-    # Add location names
-    if city:
-        xmp_content += f'''   <photoshop:City>{city}</photoshop:City>
-'''
-    if state:
-        xmp_content += f'''   <photoshop:State>{state}</photoshop:State>
-'''
-    if country:
-        xmp_content += f'''   <photoshop:Country>{country}</photoshop:Country>
-'''
-    
-    # Add file information
-    if file_name:
-        xmp_content += f'''   <xmp:Identifier>{file_name}</xmp:Identifier>
-'''
-    
-    # Add software and creation info
-    xmp_content += f'''   <xmp:CreatorTool>Immich Face Export Tool</xmp:CreatorTool>
-'''
-    
-    # Add people tags for general compatibility
-    unique_people = set()
-    for person in people:
-        person_name = person.get('name', 'Unknown')
-        if person_name and person_name != 'Unknown':
-            unique_people.add(person_name)
-    
+        add_tag(lines, "exif:GPSLatitude", latitude)
+        add_tag(lines, "exif:GPSLongitude", longitude)
+
+    add_tag(lines, "photoshop:City", exif_str("city"))
+    add_tag(lines, "photoshop:State", exif_str("state"))
+    add_tag(lines, "photoshop:Country", exif_str("country"))
+
+    # --- File info ---
+    file_name = asset_data.get("file_name", "") or ""
+    add_tag(lines, "xmp:Identifier", file_name)
+    lines.append("   <xmp:CreatorTool>Immich Face Export Tool</xmp:CreatorTool>")
+
+    # --- General people keywords (dc:subject) ---
+    unique_people = sorted(
+        {
+            (p.get("name") or "").strip()
+            for p in people
+            if (p.get("name") or "").strip() and (p.get("name") or "").strip() != "Unknown"
+        }
+    )
     if unique_people:
-        xmp_content += '''   <dc:subject>
-    <rdf:Bag>
-'''
-        for person_name in sorted(unique_people):
-            xmp_content += f'''     <rdf:li>{person_name}</rdf:li>
-'''
-        xmp_content += '''    </rdf:Bag>
-   </dc:subject>
-'''
-    
-    # Add AppliedToDimensions
-    xmp_content += f'''   <mwg-rs:Regions rdf:parseType="Resource">
-    <mwg-rs:AppliedToDimensions
-     stDim:w="{raw_w}"
-     stDim:h="{raw_h}"
-     stDim:unit="pixel"/>
-    <mwg-rs:RegionList>
-    <rdf:Bag>
-'''
+        lines.extend(["   <dc:subject>", "    <rdf:Bag>"])
+        for name in unique_people:
+            lines.append(f"     <rdf:li>{xml_text(name)}</rdf:li>")
+        lines.extend(["    </rdf:Bag>", "   </dc:subject>"])
 
-    # Populate Face Regions
+    # --- Face Regions (MWG) ---
+    lines.extend(
+        [
+            '   <mwg-rs:Regions rdf:parseType="Resource">',
+            "    <mwg-rs:AppliedToDimensions",
+            f'     stDim:w="{raw_w}"',
+            f'     stDim:h="{raw_h}"',
+            '     stDim:unit="pixel"/>',
+            "    <mwg-rs:RegionList>",
+            "    <rdf:Bag>",
+        ]
+    )
+
+    def add_face_region(person_name: str, face: Dict[str, Any]) -> None:
+        raw_cx, raw_cy, raw_fw, raw_fh = _calculate_unrotated_face_coords(
+            face, orientation_val, raw_w, raw_h
+        )
+        lines.extend(
+            [
+                "     <rdf:li>",
+                "      <rdf:Description",
+                f'       mwg-rs:Name="{xml_text(person_name)}"',
+                '       mwg-rs:Type="Face">',
+                "       <mwg-rs:Area",
+                f'        stArea:x="{raw_cx:.6f}"',
+                f'        stArea:y="{raw_cy:.6f}"',
+                f'        stArea:w="{raw_fw:.6f}"',
+                f'        stArea:h="{raw_fh:.6f}"',
+                '        stArea:unit="normalized"/>',
+                "      </rdf:Description>",
+                "     </rdf:li>",
+            ]
+        )
+
     for person in people:
-        person_name = person.get("name", "Unknown")
-        
-        face_list = person.get("faces")
-        if not face_list:
-            continue
-            
-        for face in face_list:
-            raw_cx, raw_cy, raw_fw, raw_fh = _calculate_unrotated_face_coords(
-                face, orientation_val, raw_w, raw_h
-            )
+        person_name = (person.get("name") or "Unknown").strip() or "Unknown"
+        for face in (person.get("faces") or []):
+            add_face_region(person_name, face)
 
-            xmp_content += f'''     <rdf:li>
-      <rdf:Description
-       mwg-rs:Name="{person_name}"
-       mwg-rs:Type="Face">
-       <mwg-rs:Area
-        stArea:x="{raw_cx:.6f}"
-        stArea:y="{raw_cy:.6f}"
-        stArea:w="{raw_fw:.6f}"
-        stArea:h="{raw_fh:.6f}"
-        stArea:unit="normalized"/>
-      </rdf:Description>
-     </rdf:li>
-'''
-    
-    # XMP footer
-    xmp_content += '''    </rdf:Bag>
-    </mwg-rs:RegionList>
-   </mwg-rs:Regions>
-  </rdf:Description>
- </rdf:RDF>
-</x:xmpmeta>
-'''
-    
-    return xmp_content
+    lines.extend(
+        [
+            "    </rdf:Bag>",
+            "    </mwg-rs:RegionList>",
+            "   </mwg-rs:Regions>",
+            "  </rdf:Description>",
+            " </rdf:RDF>",
+            "</x:xmpmeta>",
+            "",
+        ]
+    )
+
+    return "\n".join(lines)
 
 
 def save_xmp_sidecar(original_path: str, xmp_content: str, output_dir: str = "") -> bool:
