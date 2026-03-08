@@ -201,110 +201,12 @@ def authenticate(email: str, password: str) -> Optional[str]:
     
     try:
         response = api_request("POST", "/auth/login", data=payload)
-                                                                     
-                                   
         return response.json()["accessToken"]
     except requests.exceptions.RequestException as e:
         print(f"Authentication failed: {e}")
         return None
     except (KeyError, json.JSONDecodeError) as e:
         print(f"Failed to parse authentication response: {e}")
-        return None
-
-
-                                                          
-                                                 
-                                    
-                                                             
-                  
-
-
-def get_all_asset_ids(access_token: str, max_assets: Optional[int] = None) -> List[str]:
-    """Get all asset IDs efficiently using search API."""
-    asset_ids = []
-    page = 1
-    
-    print("Collecting asset IDs...")
-    
-    while True:
-        # Check if we've reached the maximum number of assets
-        if max_assets is not None and len(asset_ids) >= max_assets:
-            print(f"  Reached maximum asset limit: {max_assets}")
-            break
-        try:
-            # Search for assets - just get basic info with IDs
-            search_payload = {
-                "page": page,
-                "size": 200,  # Larger batch size for efficiency
-                "isVisible": True
-            }
-            
-            response = api_request("POST", "/search/metadata", token=access_token, json=search_payload)
-                                                     
-                                                       
-                                   
-             
-                                       
-            
-            search_data = response.json()
-            assets_data = search_data.get('assets', {})
-            items = assets_data.get('items', [])
-            
-            if not items:
-                break
-                
-            # Extract just the IDs
-            page_ids = [item.get('id', '') for item in items if item.get('id')]
-            
-            # Apply max_assets limit if specified
-            if max_assets is not None:
-                remaining_slots = max_assets - len(asset_ids)
-                if remaining_slots <= 0:
-                    break
-                # Only take what we need to reach the limit
-                page_ids = page_ids[:remaining_slots]
-            
-            asset_ids.extend(page_ids)
-            
-            print(f"  Page {page}: Collected {len(page_ids)} IDs, total: {len(asset_ids)}")
-            
-            # Check next page
-            next_page = assets_data.get('nextPage')
-            if not next_page:
-                print("  No more pages available")
-                break
-                
-            try:
-                page = int(next_page)
-            except (ValueError, TypeError):
-                print(f"Warning: Invalid nextPage value: {next_page}, stopping collection")
-                break
-            
-        except requests.exceptions.RequestException as e:
-            print(f"Error collecting asset IDs on page {page}: {e}")
-            break
-        except (KeyError, json.JSONDecodeError) as e:
-            print(f"Error parsing ID collection response on page {page}: {e}")
-            break
-    
-    print(f"✅ Collected {len(asset_ids)} asset IDs")
-    return asset_ids
-
-
-def get_asset_with_faces(access_token: str, asset_id: str) -> Optional[Dict[str, Any]]:
-    """Get detailed asset info including face data."""
-    try:
-        response = api_request("GET", f"/assets/{asset_id}", token=access_token)
-                                                                     
-                                   
-        
-        return response.json()
-        
-    except requests.exceptions.RequestException as e:
-        print(f"Error getting asset {asset_id}: {e}")
-        return None
-    except (KeyError, json.JSONDecodeError) as e:
-        print(f"Error parsing asset response {asset_id}: {e}")
         return None
 
 
@@ -592,57 +494,85 @@ def save_xmp_sidecar(original_path: str, xmp_content: str, output_dir: str = "")
 
 
 def process_assets_with_faces(access_token: str, max_assets: Optional[int] = None) -> List[Dict[str, Any]]:
-    """Process assets and collect those with face recognition data."""
-    processed_assets = []
+    """Process assets and collect those with face recognition data efficiently."""
+    processed_assets =[]
+    page = 1
     
-    print("Step 1: Collecting asset IDs...")
-    asset_ids = get_all_asset_ids(access_token, max_assets)
+    print("Collecting assets with faces...")
     
-    if not asset_ids:
-        print("No asset IDs collected")
-        return processed_assets
-    
-    print(f"\nStep 2: Processing {len(asset_ids)} assets for face data...")
-    
-    # Apply max_assets limit to processing loop as well
-    if max_assets is not None:
-        asset_ids = asset_ids[:max_assets]
-        print(f"  Limited to processing {len(asset_ids)} assets (max_assets limit)")
-    
-    # Process assets one by one to avoid hardcoded batch limits
-    total_with_faces = 0
-    
-    for i, asset_id in enumerate(asset_ids):
-        detailed_asset = get_asset_with_faces(access_token, asset_id)
-        
-        if detailed_asset:
-            people = detailed_asset.get('people', [])
+    while True:
+        # Check limit
+        if max_assets is not None and len(processed_assets) >= max_assets:
+            print(f"  Reached maximum asset limit: {max_assets}")
+            break
             
-            if people and len(people) > 0:
-                # Count total faces
-                total_faces = sum(len(person.get('faces', [])) for person in people)
+        try:
+            # withPeople=True: Ask Immich to ONLY return assets that have detected faces
+            # withExif=True: Embed the EXIF data directly in this list response
+            search_payload = {
+                "page": page,
+                "size": 200,          # Fetch 200 fully-populated assets at once
+                "withPeople": True,
+                "withExif": True
+            }
+            
+            # The search endpoint acts as searchAssets when payload matches metadata parameters
+            response = api_request("POST", "/search/metadata", token=access_token, json=search_payload)
+            search_data = response.json()
+            
+            # Extract items list
+            assets_data = search_data.get('assets', search_data)
+            items = assets_data.get('items',[])
+            
+            if not items:
+                print("  No more items available")
+                break
                 
-                file_name = detailed_asset.get('originalFileName', 'Unknown')
-                print(f"    Asset {total_with_faces+1}: {file_name} - {len(people)} people, {total_faces} faces")
+            for item in items:
+                # Stop if we hit the limit during the page loop
+                if max_assets is not None and len(processed_assets) >= max_assets:
+                    break
+                    
+                people = item.get('people',[])
                 
-                # Prepare asset info
+                # Because of withPeople=True, this shouldn't be empty, but we check just in case
+                if not people:
+                    continue
+                    
+                total_faces = sum(len(person.get('faces',[])) for person in people)
+                file_name = item.get('originalFileName', 'Unknown')
+                
+                print(f"    Asset {len(processed_assets)+1}: {file_name} - {len(people)} people, {total_faces} faces")
+                
                 asset_info = {
-                    'asset_id': asset_id,
-                    'original_path': detailed_asset.get('originalPath', ''),
+                    'asset_id': item.get('id', ''),
+                    'original_path': item.get('originalPath', ''),
                     'file_name': file_name,
-                    'exifInfo': detailed_asset.get('exifInfo', {}),
-                    'people': people  # Include people data directly in asset
+                    'exifInfo': item.get('exifInfo', {}),
+                    'people': people
                 }
                 
                 processed_assets.append(asset_info)
+            
+            # Check next page
+            next_page = assets_data.get('nextPage')
+            if not next_page:
+                break
                 
-                total_with_faces += 1
-        
-        # Progress update every 20 assets
-        if (i + 1) % 20 == 0:
-            print(f"    Progress: {i+1}/{len(asset_ids)} assets processed")
-    
-    print(f"\n✅ Processing completed: Found {total_with_faces} assets with faces")
+            # Safely increment page (in case Immich ever switches to string-based cursors)
+            try:
+                page = int(next_page)
+            except (ValueError, TypeError):
+                page += 1
+                
+        except requests.exceptions.RequestException as e:
+            print(f"Error collecting assets on page {page}: {e}")
+            break
+        except (KeyError, json.JSONDecodeError) as e:
+            print(f"Error parsing asset collection response on page {page}: {e}")
+            break
+            
+    print(f"\n✅ Processing completed: Found {len(processed_assets)} assets with faces")
     return processed_assets
 
 
