@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
 Face recognition export script for Immich.
-Uses search API to get asset IDs, then detailed API to get face data.
-Exports face recognition data to DigiKam-compatible XMP format.
-Supports two-stage processing: JSON export first, then XMP generation.
+Uses search API to get face data.
+Exports face recognition data to XMP format, supported by digiKam, XnView MP and others.
 """
 
 import requests
@@ -219,10 +218,10 @@ def _parse_orientation(orientation) -> int:
         o_lower = str(orientation).lower()
         if any(x in o_lower for x in['6', 'right top', 'right-top', '90 cw']):
             return 6
-        elif any(x in o_lower for x in['8', 'left bottom', 'left-bottom', '270 cw']):
-            return 8
         elif any(x in o_lower for x in['3', 'bottom right', '180']):
             return 3
+        elif any(x in o_lower for x in['8', 'left bottom', 'left-bottom', '270 cw']):
+            return 8
         elif any(x in o_lower for x in['2', 'top right', 'mirror horizontal']):
             return 2
         elif any(x in o_lower for x in ['4', 'bottom left', 'mirror vertical']):
@@ -236,7 +235,7 @@ def _parse_orientation(orientation) -> int:
 
 
 def _calculate_unrotated_face_coords(face: Dict[str, Any], orientation_val: int, raw_w: int, raw_h: int):
-    """Transform Immich visual face coordinates back to raw unrotated space for DigiKam."""
+    """Transform Immich visual face coordinates back to raw unrotated space."""
     ml_w = face.get('imageWidth')
     ml_h = face.get('imageHeight')
 
@@ -284,8 +283,8 @@ def _calculate_unrotated_face_coords(face: Dict[str, Any], orientation_val: int,
     return raw_cx, raw_cy, raw_fw, raw_fh
 
 
-def create_digikam_xmp_content(asset_data: Dict[str, Any]) -> str:
-    """Create DigiKam-compatible XMP content for face recognition data with EXIF information."""
+def create_xmp_content(asset_data: Dict[str, Any]) -> str:
+    """Create XMP content for face recognition data with EXIF information."""
 
     people = asset_data.get("people") or []
     if not people:
@@ -625,7 +624,7 @@ def write_xmp_for_assets(
 ) -> bool:
     """
     Common implementation: take a list of processed assets (each containing 'people' face data)
-    and write DigiKam-compatible XMP sidecars + a summary file.
+    and write XMP sidecars + a summary file.
 
     Args:
         processed_assets: List of asset dicts produced by process_assets_with_faces()
@@ -663,7 +662,7 @@ def write_xmp_for_assets(
             continue
 
         # Create XMP content
-        xmp_content = create_digikam_xmp_content(asset_data)
+        xmp_content = create_xmp_content(asset_data)
 
         if not xmp_content.strip():
             print(f"    Warning: Empty XMP content for asset {file_label}")
@@ -712,7 +711,7 @@ def write_xmp_for_assets(
         print(f"Error saving summary file: {e}")
 
     # Print stats
-    print(f"\n✅ DigiKam XMP export completed!")
+    print(f"\n✅ XMP export completed!")
     print(f"📊 Statistics:")
     print(f"   Total assets processed: {len(processed_assets)}")
     print(f"   XMP sidecar files created: {total_files_created}")
@@ -733,9 +732,9 @@ def write_xmp_for_assets(
     return True
 
 
-def export_faces_to_digikam_xmp_from_json(json_file_path: str, output_dir: str = "xmp_sidecars") -> bool:
-    """Export face recognition data to DigiKam XMP format from JSON file (Stage 2)."""
-    print("Starting face recognition export to DigiKam XMP format from JSON file (Stage 2)...")
+def export_faces_to_xmp_from_json(json_file_path: str, output_dir: str = "xmp_sidecars") -> bool:
+    """Export face recognition data to XMP format from JSON file (Stage 2)."""
+    print("Starting face recognition export to XMP format from JSON file (Stage 2)...")
     print(f"JSON source: {json_file_path}")
 
     try:
@@ -754,11 +753,11 @@ def export_faces_to_digikam_xmp_from_json(json_file_path: str, output_dir: str =
     return write_xmp_for_assets(processed_assets, output_dir, json_source=json_file_path)
 
 
-def export_faces_to_digikam_xmp(access_token: str, output_dir: str = "xmp_sidecars", max_assets: Optional[int] = None) -> bool:
+def export_faces_to_xmp(access_token: str, output_dir: str = "xmp_sidecars", max_assets: Optional[int] = None) -> bool:
     """
     Direct one-stage export: Immich API -> processed assets -> XMP sidecars (no JSON intermediate).
     """
-    print("Starting DIRECT face recognition export to DigiKam XMP format (API -> XMP, no JSON)...")
+    print("Starting DIRECT face recognition export to XMP format (API -> XMP, no JSON)...")
 
     processed_assets = process_assets_with_faces(access_token, max_assets)
     if not processed_assets:
@@ -771,7 +770,7 @@ def export_faces_to_digikam_xmp(access_token: str, output_dir: str = "xmp_sideca
 def parse_arguments():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
-        description='Export face recognition data from Immich to DigiKam XMP format',
+        description='Export face recognition data from Immich to XMP format',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog='''
 Examples:
@@ -871,7 +870,7 @@ def main():
         # Use custom XMP directory if specified, otherwise use config
         xmp_dir = args.xmp_dir or config.get_output_config()['digikam_xmp_dir']
         
-        success = export_faces_to_digikam_xmp_from_json(args.json_file, xmp_dir)
+        success = export_faces_to_xmp_from_json(args.json_file, xmp_dir)
         
         if success:
             print(f"\n🎉 XMP files generated successfully from JSON!")
@@ -912,7 +911,7 @@ def main():
     # Direct one-stage export (API -> XMP), no JSON written
     if args.direct_xmp:
         print("\nRunning direct XMP export (single stage): API -> XMP (no intermediate JSON)")
-        success = export_faces_to_digikam_xmp(access_token, xmp_dir, args.max_assets)
+        success = export_faces_to_xmp(access_token, xmp_dir, args.max_assets)
         if success:
             print(f"\n🎉 Direct XMP export completed successfully!")
             print(f"   XMP files: {xmp_dir}")
@@ -935,7 +934,7 @@ def main():
     
     # Stage 2: Generate XMP from JSON
     print(f"\nProceeding to Stage 2: Generate XMP files from JSON...")
-    success = export_faces_to_digikam_xmp_from_json(json_file_path, xmp_dir)
+    success = export_faces_to_xmp_from_json(json_file_path, xmp_dir)
     
     if success:
         print(f"\n🎉 Both stages completed successfully!")
