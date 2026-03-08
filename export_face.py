@@ -146,7 +146,7 @@ config = ConfigLoader()
 
 # Get configuration from config file
 immich_config = config.get_immich_config()
-IMMICH_BASE_URL = immich_config['base_url']
+IMMICH_BASE_URL = immich_config['base_url'].rstrip('/')
 IMMICH_API_BASE = f"{IMMICH_BASE_URL}/api"
 output_config = config.get_output_config()
 settings_config = config.get_settings_config()
@@ -459,22 +459,17 @@ def save_xmp_sidecar(original_path: str, xmp_content: str, output_dir: str = "")
         if output_dir:
             output_base = Path(output_dir)
             
-            # Extract relative path from original path
-            # For: /myphoto/2025-09/yuhuan/file.jpg -> relative: 2025-09/yuhuan/file.xmp
-            original_parts = original_path_obj.parts
+            # Extract the parent directory of the original file
+            parent_dir = original_path_obj.parent
             
-            # Build relative directory structure (skip root like '/myphoto')
-            if len(original_parts) > 2:  # Has subdirectories
-                # Take all parts after the root directory
-                relative_parts = original_parts[1:-1]  # Skip root and filename
-                if relative_parts:
-                    relative_dir = Path(*relative_parts)
-                    xmp_path = output_base / relative_dir / filename
-                else:
-                    xmp_path = output_base / filename
+            # Strip absolute roots ('/' or 'C:\') to safely append to output_base
+            if parent_dir.is_absolute():
+                rel_dir = parent_dir.relative_to(parent_dir.anchor)
             else:
-                # Just filename, no subdirectories
-                xmp_path = output_base / filename
+                # If it's already a relative path, keep it exactly as is
+                rel_dir = parent_dir
+                
+            xmp_path = output_base / rel_dir / filename
             
             # Ensure the parent directories exist
             xmp_path.parent.mkdir(parents=True, exist_ok=True)
@@ -539,7 +534,7 @@ def process_assets_with_faces(access_token: str, max_assets: Optional[int] = Non
                 if not people:
                     continue
                     
-                total_faces = sum(len(person.get('faces',[])) for person in people)
+                total_faces = sum(len(person.get('faces') or[]) for person in people)
                 file_name = item.get('originalFileName', 'Unknown')
                 
                 print(f"    Asset {len(processed_assets)+1}: {file_name} - {len(people)} people, {total_faces} faces")
