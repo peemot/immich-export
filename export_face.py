@@ -7,6 +7,8 @@ Supports two-stage processing: JSON export first, then XMP generation.
 """
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import json
 import os
 import argparse
@@ -147,11 +149,50 @@ immich_config = config.get_immich_config()
 IMMICH_BASE_URL = immich_config['base_url']
 IMMICH_API_BASE = f"{IMMICH_BASE_URL}/api"
 output_config = config.get_output_config()
+settings_config = config.get_settings_config()
+
+REQUEST_TIMEOUT = settings_config['request_timeout']
+RETRY_ATTEMPTS = settings_config['retry_attempts']
 
 DEFAULT_HEADERS = {
     'Content-Type': 'application/json',
     'Accept': 'application/json'
 }
+
+def create_http_session(retries: int) -> requests.Session:
+    """Create a requests session with automatic retries."""
+    session = requests.Session()
+    retry_strategy = Retry(
+        total=retries,
+        backoff_factor=1,  # Wait 1s, 2s, 4s between retries
+        status_forcelist=[429, 500, 502, 503, 504],
+        # By default, urllib3 doesn't retry POST requests. We must allow it 
+        # because the Immich search API uses POST.
+        allowed_methods=["HEAD", "GET", "POST", "OPTIONS"] 
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+# Initialize the global session
+http_session = create_http_session(RETRY_ATTEMPTS)
+
+
+def api_request(method: str, path: str, *, token: str | None = None, **kwargs) -> requests.Response:
+    headers = DEFAULT_HEADERS.copy()
+    if token:
+        headers["Cookie"] = f"immich_access_token={token}"
+
+    resp = http_session.request(
+        method,
+        f"{IMMICH_API_BASE}{path}",
+        headers=headers,
+        timeout=REQUEST_TIMEOUT,
+        **kwargs,
+    )
+    resp.raise_for_status()
+    return resp
 
 
 def authenticate(email: str, password: str) -> Optional[str]:
@@ -159,9 +200,9 @@ def authenticate(email: str, password: str) -> Optional[str]:
     payload = json.dumps({"email": email, "password": password})
     
     try:
-        response = requests.post(f"{IMMICH_API_BASE}/auth/login", 
-                               headers=DEFAULT_HEADERS, data=payload)
-        response.raise_for_status()
+        response = api_request("POST", "/auth/login", data=payload)
+                                                                     
+                                   
         return response.json()["accessToken"]
     except requests.exceptions.RequestException as e:
         print(f"Authentication failed: {e}")
@@ -171,11 +212,11 @@ def authenticate(email: str, password: str) -> Optional[str]:
         return None
 
 
-def get_auth_headers(access_token: str) -> Dict[str, str]:
-    """Get headers with authentication cookie."""
-    headers = DEFAULT_HEADERS.copy()
-    headers['Cookie'] = f'immich_access_token={access_token}'
-    return headers
+                                                          
+                                                 
+                                    
+                                                             
+                  
 
 
 def get_all_asset_ids(access_token: str, max_assets: Optional[int] = None) -> List[str]:
@@ -198,12 +239,12 @@ def get_all_asset_ids(access_token: str, max_assets: Optional[int] = None) -> Li
                 "isVisible": True
             }
             
-            response = requests.post(
-                f"{IMMICH_API_BASE}/search/metadata",
-                headers=get_auth_headers(access_token),
-                json=search_payload
-            )
-            response.raise_for_status()
+            response = api_request("POST", "/search/metadata", token=access_token, json=search_payload)
+                                                     
+                                                       
+                                   
+             
+                                       
             
             search_data = response.json()
             assets_data = search_data.get('assets', {})
@@ -253,9 +294,9 @@ def get_all_asset_ids(access_token: str, max_assets: Optional[int] = None) -> Li
 def get_asset_with_faces(access_token: str, asset_id: str) -> Optional[Dict[str, Any]]:
     """Get detailed asset info including face data."""
     try:
-        response = requests.get(f"{IMMICH_API_BASE}/assets/{asset_id}", 
-                              headers=get_auth_headers(access_token))
-        response.raise_for_status()
+        response = api_request("GET", f"/assets/{asset_id}", token=access_token)
+                                                                     
+                                   
         
         return response.json()
         
