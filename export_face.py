@@ -49,6 +49,7 @@ class ConfigLoader:
         """Load configuration from environment variables."""
         env_mappings = {
             'IMMICH_BASE_URL': ['immich', 'base_url'],
+            'IMMICH_API_KEY': ['immich', 'api_key'],
             'IMMICH_EMAIL': ['immich', 'email'],
             'IMMICH_PASSWORD': ['immich', 'password'],
             'IMMICH_REQUEST_TIMEOUT': ['settings', 'request_timeout'],
@@ -95,6 +96,7 @@ class ConfigLoader:
         """Get Immich connection configuration."""
         return {
             'base_url': self.get('immich.base_url', 'https://www.blahblah.com'),
+            'api_key': self.get('immich.api_key', ''),
             'email': self.get('immich.email', ''),
             'password': self.get('immich.password', '')
         }
@@ -117,16 +119,20 @@ class ConfigLoader:
         """Validate that required Immich configuration is present."""
         immich_config = self.get_immich_config()
         
-        if not immich_config['email'] or not immich_config['password']:
-            print("❌ Configuration error: Email and password are required")
-            print("   Please set them in config.json or use environment variables:")
-            print("   IMMICH_EMAIL and IMMICH_PASSWORD")
-            return False
-        
         if immich_config['base_url'] == 'https://www.blahblah.com':
             print("❌ Configuration error: Please update the Immich server URL")
             print("   Set it in config.json or use environment variable:")
             print("   IMMICH_BASE_URL")
+            return False
+
+        has_api_key = bool(immich_config['api_key'])
+        has_credentials = bool(immich_config['email'] and immich_config['password'])
+
+        if not has_api_key and not has_credentials:
+            print("❌ Configuration error: API key OR Email and password are required")
+            print("   Please set them in config.json or use environment variables:")
+            print("   IMMICH_API_KEY or (IMMICH_EMAIL and IMMICH_PASSWORD)")
+            print("   Note: If using an API key, it must have at least 'asset.read' permission.")
             return False
         
         return True
@@ -135,7 +141,10 @@ class ConfigLoader:
         """Print a summary of loaded configuration."""
         print("\n📋 Configuration Summary:")
         print(f"   Server URL: {self.get('immich.base_url')}")
-        print(f"   Email: {self.get('immich.email')}")
+        if self.get('immich.api_key'):
+            print("   Auth Method: API Key")
+        else:
+            print(f"   Auth Method: Email ({self.get('immich.email')})")
         print(f"   Timeout: {self.get('settings.request_timeout')}s")
         print(f"   Retry Attempts: {self.get('settings.retry_attempts')}")
 
@@ -180,7 +189,11 @@ http_session = create_http_session(RETRY_ATTEMPTS)
 
 def api_request(method: str, path: str, *, token: str | None = None, **kwargs) -> requests.Response:
     headers = DEFAULT_HEADERS.copy()
-    if token:
+    api_key = immich_config.get('api_key')
+    
+    if api_key:
+        headers["x-api-key"] = api_key
+    elif token:
         headers["Cookie"] = f"immich_access_token={token}"
 
     resp = http_session.request(
@@ -883,6 +896,7 @@ def main():
     
     # Get configuration
     immich_config = config.get_immich_config()
+    api_key = immich_config['api_key']
     email = immich_config['email']
     password = immich_config['password']
     output_config = config.get_output_config()
@@ -898,13 +912,16 @@ def main():
     if args.max_assets:
         print(f"Maximum assets to process: {args.max_assets}")
     
-    # Step 1: Authenticate
-    access_token = authenticate(email, password)
-    if not access_token:
-        print("❌ Authentication failed. Please check your credentials and server URL.")
-        return
-    
-    print("✅ Authentication successful")
+    # Authenticate
+    if api_key:
+        print("✅ Using API Key for authentication")
+        access_token = "api_key_used"  # Dummy token for backwards compatibility
+    else:
+        access_token = authenticate(email, password)
+        if not access_token:
+            print("❌ Authentication failed. Please check your credentials and server URL.")
+            return
+        print("✅ Authentication successful")
     
     # Direct one-stage export (API -> XMP), no JSON written
     if args.direct_xmp:
