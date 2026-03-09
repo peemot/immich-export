@@ -53,7 +53,7 @@ class ConfigLoader:
             'IMMICH_PASSWORD': ['immich', 'password'],
             'IMMICH_REQUEST_TIMEOUT': ['settings', 'request_timeout'],
             'IMMICH_RETRY_ATTEMPTS': ['settings', 'retry_attempts'],
-            'OUTPUT_DIGIKAM_XMP_DIR': ['output', 'digikam_xmp_dir']
+            'OUTPUT_XMP_DIR': ['output', 'xmp_export_dir']
         }
         
         for env_var, config_path in env_mappings.items():
@@ -102,7 +102,7 @@ class ConfigLoader:
     def get_output_config(self) -> Dict[str, str]:
         """Get output configuration."""
         return {
-            'digikam_xmp_dir': self.get('output.digikam_xmp_dir', 'digikam_xmp_sidecars'),
+            'xmp_export_dir': self.get('output.xmp_export_dir', 'xmp_sidecars'),
             'json_export_dir': self.get('output.json_export_dir', 'json_exports')
         }
     
@@ -451,23 +451,21 @@ def save_xmp_sidecar(original_path: str, xmp_content: str, output_dir: str = "")
         return False  # Skip empty XMP
         
     try:
-        # Create sidecar filename (same name with original extension + .xmp)
-        original_path_obj = Path(original_path)
+        # Strip leading slashes to prevent Python from jumping to the root drive.
+        clean_path = str(original_path).lstrip('/\\')
+        
+        # Strip Windows drive letters (e.g., C:) if they somehow exist
+        if len(clean_path) > 1 and clean_path[1] == ':':
+            clean_path = clean_path[2:].lstrip('/\\')
+            
+        original_path_obj = Path(clean_path)
         filename = original_path_obj.name + '.xmp'
         
         if output_dir:
             output_base = Path(output_dir)
             
-            # Extract the parent directory of the original file
-            parent_dir = original_path_obj.parent
-            
-            # Strip absolute roots ('/' or 'C:\') to safely append to output_base
-            if parent_dir.is_absolute():
-                rel_dir = parent_dir.relative_to(parent_dir.anchor)
-            else:
-                # If it's already a relative path, keep it exactly as is
-                rel_dir = parent_dir
-                
+            # Because clean_path has no root, this is guaranteed to stay inside the output_base directory!
+            rel_dir = original_path_obj.parent
             xmp_path = output_base / rel_dir / filename
             
             # Ensure the parent directories exist
@@ -868,7 +866,7 @@ def main():
         print("Running Stage 2 only: Generate XMP from JSON file")
         
         # Use custom XMP directory if specified, otherwise use config
-        xmp_dir = args.xmp_dir or config.get_output_config()['digikam_xmp_dir']
+        xmp_dir = args.xmp_dir or config.get_output_config()['xmp_export_dir']
         
         success = export_faces_to_xmp_from_json(args.json_file, xmp_dir)
         
@@ -891,7 +889,7 @@ def main():
     
     # Use custom directories if specified, otherwise use config
     json_dir = args.json_dir or output_config['json_export_dir']
-    xmp_dir = args.xmp_dir or output_config['digikam_xmp_dir']
+    xmp_dir = args.xmp_dir or output_config['xmp_export_dir']
     
     print("Starting Immich face recognition export...")
     print(f"Server: {IMMICH_BASE_URL}")

@@ -54,7 +54,7 @@ Fill in your Immich server information in `config.json`:
     "retry_attempts": 3
   },
   "output": {
-    "digikam_xmp_dir": "digikam_xmp_sidecars",
+    "xmp_export_dir": "xmp_sidecars",
     "json_export_dir": "json_exports"
   }
 }
@@ -116,7 +116,7 @@ json_exports/
 
 ### XMP Files (Stage 2)
 ```
-digikam_xmp_sidecars/
+xmp_sidecars/
 ├── export_summary.json          # Export statistics report
 ├── your-photo1.jpg.xmp         # XMP sidecar file
 ├── your-photo2.jpg.xmp
@@ -143,7 +143,7 @@ digikam_xmp_sidecars/
 | `immich.password` | `IMMICH_PASSWORD` | - | Login password |
 | `settings.request_timeout` | `IMMICH_REQUEST_TIMEOUT` | 30 | API request timeout (seconds) |
 | `settings.retry_attempts` | `IMMICH_RETRY_ATTEMPTS` | 3 | Number of retry attempts |
-| `output.digikam_xmp_dir` | `OUTPUT_DIGIKAM_XMP_DIR` | digikam_xmp_sidecars | XMP output directory |
+| `output.xmp_export_dir` | `OUTPUT_XMP_DIR` | xmp_sidecars | XMP output directory |
 | `output.json_export_dir` | `OUTPUT_JSON_EXPORT_DIR` | json_exports | JSON export directory |
 
 ## 🛠️ Development

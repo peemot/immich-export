@@ -23,7 +23,7 @@ This is a Python script for the Immich photo management system, used to export f
 /Users/yuhuan/immich_scripts/
 ├── export_face.py           # Main export script with built-in configuration loader
 ├── config.json.template     # Configuration template file
-├── digikam_xmp_sidecars/    # Output directory (XMP files)
+├── xmp_sidecars/            # Output directory (XMP files)
 │   └── myphoto/             # Sample photo directory structure
 ├── .gitignore               # Git ignore file configuration (includes config.json)
 └── IFLOW.md                 # Project documentation (this file)
@@ -60,7 +60,7 @@ Configuration template file that provides:
 - `immich.password`: Login password
 - `settings.request_timeout`: Request timeout in seconds (default: 30)
 - `settings.retry_attempts`: Retry attempts (default: 3)
-- `output.digikam_xmp_dir`: XMP output directory (default: "digikam_xmp_sidecars")
+- `output.xmp_export_dir`: XMP output directory (default: "xmp_sidecars")
 
 ## Configuration Management
 
@@ -89,7 +89,7 @@ Configuration template file that provides:
      "retry_attempts": 3
    },
      "output": {
-       "digikam_xmp_dir": "digikam_xmp_sidecars"
+       "xmp_export_dir": "xmp_sidecars"
      }
    }
    ```
