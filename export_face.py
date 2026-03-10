@@ -174,8 +174,7 @@ def create_http_session(retries: int) -> requests.Session:
         total=retries,
         backoff_factor=1,  # Wait 1s, 2s, 4s between retries
         status_forcelist=[429, 500, 502, 503, 504],
-        # By default, urllib3 doesn't retry POST requests. We must allow it 
-        # because the Immich search API uses POST.
+        # By default, urllib3 doesn't retry POST requests but Immich search API uses POST.
         allowed_methods=["HEAD", "GET", "POST", "OPTIONS"] 
     )
     adapter = HTTPAdapter(max_retries=retry_strategy)
@@ -209,10 +208,10 @@ def api_request(method: str, path: str, *, token: str | None = None, **kwargs) -
 
 def authenticate(email: str, password: str) -> Optional[str]:
     """Authenticate with Immich API and return access token."""
-    payload = json.dumps({"email": email, "password": password})
+    payload = {"email": email, "password": password}
     
     try:
-        response = api_request("POST", "/auth/login", data=payload)
+        response = api_request("POST", "/auth/login", json=payload)
         return response.json()["accessToken"]
     except requests.exceptions.RequestException as e:
         print(f"Authentication failed: {e}")
@@ -391,13 +390,9 @@ def create_xmp_content(asset_data: Dict[str, Any]) -> str:
     lines.append("   <xmp:CreatorTool>Immich Face Export Tool</xmp:CreatorTool>")
 
     # --- General people keywords (dc:subject) ---
-    unique_people = sorted(
-        {
-            (p.get("name") or "").strip()
-            for p in people
-            if (p.get("name") or "").strip() and (p.get("name") or "").strip() != "Unknown"
-        }
-    )
+    names =[(p.get("name") or "").strip() for p in people]
+    unique_people = sorted({name for name in names if name and name != "Unknown"})
+        
     if unique_people:
         lines.extend(["   <dc:subject>", "    <rdf:Bag>"])
         for name in unique_people:
@@ -587,7 +582,7 @@ def export_faces_to_json(access_token: str, json_output_dir: str = "json_exports
     
     # Create output directory
     output_path = Path(json_output_dir)
-    output_path.mkdir(exist_ok=True)
+    output_path.mkdir(parents=True, exist_ok=True)
     
     # Process assets with faces
     processed_assets = process_assets_with_faces(access_token, max_assets)
