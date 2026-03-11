@@ -182,11 +182,8 @@ def create_http_session(retries: int) -> requests.Session:
     session.mount("https://", adapter)
     return session
 
-# Initialize the global session
-http_session = create_http_session(RETRY_ATTEMPTS)
 
-
-def api_request(method: str, path: str, *, token: str | None = None, **kwargs) -> requests.Response:
+def api_request(session: requests.Session, method: str, path: str, *, token: str | None = None, **kwargs) -> requests.Response:
     headers = DEFAULT_HEADERS.copy()
     api_key = immich_config.get('api_key')
     
@@ -195,7 +192,8 @@ def api_request(method: str, path: str, *, token: str | None = None, **kwargs) -
     elif token:
         headers["Cookie"] = f"immich_access_token={token}"
 
-    resp = http_session.request(
+    # Use the passed-in session here
+    resp = session.request(
         method,
         f"{IMMICH_API_BASE}{path}",
         headers=headers,
@@ -206,12 +204,11 @@ def api_request(method: str, path: str, *, token: str | None = None, **kwargs) -
     return resp
 
 
-def authenticate(email: str, password: str) -> Optional[str]:
+def authenticate(session: requests.Session, email: str, password: str) -> Optional[str]:
     """Authenticate with Immich API and return access token."""
     payload = {"email": email, "password": password}
-    
     try:
-        response = api_request("POST", "/auth/login", json=payload)
+        response = api_request(session, "POST", "/auth/login", json=payload) 
         return response.json()["accessToken"]
     except requests.exceptions.RequestException as e:
         print(f"Authentication failed: {e}")
@@ -493,7 +490,7 @@ def save_xmp_sidecar(original_path: str, xmp_content: str, output_dir: str = "")
         return False
 
 
-def process_assets_with_faces(access_token: str, max_assets: Optional[int] = None) -> List[Dict[str, Any]]:
+def process_assets_with_faces(session: requests.Session, access_token: str, max_assets: Optional[int] = None) -> List[Dict[str, Any]]:
     """Process assets and collect those with face recognition data efficiently."""
     processed_assets =[]
     page = 1
@@ -517,7 +514,7 @@ def process_assets_with_faces(access_token: str, max_assets: Optional[int] = Non
             }
             
             # The search endpoint acts as searchAssets when payload matches metadata parameters
-            response = api_request("POST", "/search/metadata", token=access_token, json=search_payload)
+            response = api_request(session, "POST", "/search/metadata", token=access_token, json=search_payload)
             search_data = response.json()
             
             # Extract items list
@@ -576,7 +573,7 @@ def process_assets_with_faces(access_token: str, max_assets: Optional[int] = Non
     return processed_assets
 
 
-def export_faces_to_json(access_token: str, json_output_dir: str = "json_exports", max_assets: Optional[int] = None) -> Optional[str]:
+def export_faces_to_json(session: requests.Session, access_token: str, json_output_dir: str = "json_exports", max_assets: Optional[int] = None) -> Optional[str]:
     """Export face recognition data to JSON file (Stage 1)."""
     print("Starting face recognition export to JSON format (Stage 1)...")
     
@@ -585,7 +582,7 @@ def export_faces_to_json(access_token: str, json_output_dir: str = "json_exports
     output_path.mkdir(parents=True, exist_ok=True)
     
     # Process assets with faces
-    processed_assets = process_assets_with_faces(access_token, max_assets)
+    processed_assets = process_assets_with_faces(session, access_token, max_assets)
     
     if not processed_assets:
         print("No assets with faces found")
@@ -625,7 +622,7 @@ def write_xmp_for_assets(
     output_dir: str = "xmp_sidecars",
     *,
     json_source: Optional[str] = None,
-    progress_every: int = 5,
+    progress_every: int = 10,
     top_people_to_print: int = 20
 ) -> bool:
     """
@@ -759,13 +756,13 @@ def export_faces_to_xmp_from_json(json_file_path: str, output_dir: str = "xmp_si
     return write_xmp_for_assets(processed_assets, output_dir, json_source=json_file_path)
 
 
-def export_faces_to_xmp(access_token: str, output_dir: str = "xmp_sidecars", max_assets: Optional[int] = None) -> bool:
+def export_faces_to_xmp(session: requests.Session, access_token: str, output_dir: str = "xmp_sidecars", max_assets: Optional[int] = None) -> bool:
     """
     Direct one-stage export: Immich API -> processed assets -> XMP sidecars (no JSON intermediate).
     """
     print("Starting DIRECT face recognition export to XMP format (API -> XMP, no JSON)...")
 
-    processed_assets = process_assets_with_faces(access_token, max_assets)
+    processed_assets = process_assets_with_faces(session, access_token, max_assets)
     if not processed_assets:
         print("No assets with faces found")
         return False
@@ -907,12 +904,14 @@ def main():
     if args.max_assets:
         print(f"Maximum assets to process: {args.max_assets}")
     
+    session = create_http_session(RETRY_ATTEMPTS)
+    
     # Authenticate
     if api_key:
         print("✅ Using API Key for authentication")
         access_token = "api_key_used"  # Dummy token for backwards compatibility
     else:
-        access_token = authenticate(email, password)
+        access_token = authenticate(session, email, password)
         if not access_token:
             print("❌ Authentication failed. Please check your credentials and server URL.")
             return
@@ -921,7 +920,7 @@ def main():
     # Direct one-stage export (API -> XMP), no JSON written
     if args.direct_xmp:
         print("\nRunning direct XMP export (single stage): API -> XMP (no intermediate JSON)")
-        success = export_faces_to_xmp(access_token, xmp_dir, args.max_assets)
+        success = export_faces_to_xmp(session, access_token, xmp_dir, args.max_assets)
         if success:
             print(f"\n🎉 Direct XMP export completed successfully!")
             print(f"   XMP files: {xmp_dir}")
@@ -930,7 +929,7 @@ def main():
         return
     
     # Stage 1: Export to JSON (default path)
-    json_file_path = export_faces_to_json(access_token, json_dir, args.max_assets)
+    json_file_path = export_faces_to_json(session, access_token, json_dir, args.max_assets)
     
     if not json_file_path:
         print("❌ Failed to export face data to JSON")
