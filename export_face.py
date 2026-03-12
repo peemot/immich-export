@@ -191,8 +191,7 @@ def api_request(session: requests.Session, method: str, path: str, *, token: str
         headers["x-api-key"] = api_key
     elif token:
         headers["Cookie"] = f"immich_access_token={token}"
-
-    # Use the passed-in session here
+    
     resp = session.request(
         method,
         f"{IMMICH_API_BASE}{path}",
@@ -490,7 +489,7 @@ def save_xmp_sidecar(original_path: str, xmp_content: str, output_dir: str = "")
         return False
 
 
-def process_assets_with_faces(session: requests.Session, access_token: str, max_assets: Optional[int] = None) -> List[Dict[str, Any]]:
+def process_assets_with_faces(session: requests.Session, access_token: str, max_assets: Optional[int] = None, album_id: Optional[str] = None, library_id: Optional[str] = None) -> List[Dict[str, Any]]:
     """Process assets and collect those with face recognition data efficiently."""
     processed_assets =[]
     page = 1
@@ -512,6 +511,11 @@ def process_assets_with_faces(session: requests.Session, access_token: str, max_
                 "withPeople": True,
                 "withExif": True
             }
+            
+            if album_id:
+                search_payload["albumIds"] = [album_id]
+            if library_id:
+                search_payload["libraryId"] = library_id
             
             # The search endpoint acts as searchAssets when payload matches metadata parameters
             response = api_request(session, "POST", "/search/metadata", token=access_token, json=search_payload)
@@ -573,7 +577,7 @@ def process_assets_with_faces(session: requests.Session, access_token: str, max_
     return processed_assets
 
 
-def export_faces_to_json(session: requests.Session, access_token: str, json_output_dir: str = "json_exports", max_assets: Optional[int] = None) -> Optional[str]:
+def export_faces_to_json(session: requests.Session, access_token: str, json_output_dir: str = "json_exports", max_assets: Optional[int] = None, album_id: Optional[str] = None, library_id: Optional[str] = None) -> Optional[str]:
     """Export face recognition data to JSON file (Stage 1)."""
     print("Starting face recognition export to JSON format (Stage 1)...")
     
@@ -582,7 +586,7 @@ def export_faces_to_json(session: requests.Session, access_token: str, json_outp
     output_path.mkdir(parents=True, exist_ok=True)
     
     # Process assets with faces
-    processed_assets = process_assets_with_faces(session, access_token, max_assets)
+    processed_assets = process_assets_with_faces(session, access_token, max_assets, album_id, library_id)
     
     if not processed_assets:
         print("No assets with faces found")
@@ -756,13 +760,13 @@ def export_faces_to_xmp_from_json(json_file_path: str, output_dir: str = "xmp_si
     return write_xmp_for_assets(processed_assets, output_dir, json_source=json_file_path)
 
 
-def export_faces_to_xmp(session: requests.Session, access_token: str, output_dir: str = "xmp_sidecars", max_assets: Optional[int] = None) -> bool:
+def export_faces_to_xmp(session: requests.Session, access_token: str, output_dir: str = "xmp_sidecars", max_assets: Optional[int] = None, album_id: Optional[str] = None, library_id: Optional[str] = None) -> bool:
     """
     Direct one-stage export: Immich API -> processed assets -> XMP sidecars (no JSON intermediate).
     """
     print("Starting DIRECT face recognition export to XMP format (API -> XMP, no JSON)...")
 
-    processed_assets = process_assets_with_faces(session, access_token, max_assets)
+    processed_assets = process_assets_with_faces(session, access_token, max_assets, album_id, library_id)
     if not processed_assets:
         print("No assets with faces found")
         return False
@@ -791,53 +795,22 @@ Examples:
   
   # Specify custom output directories
   python export_face.py --json-dir my_json_exports --xmp-dir my_xmp_files
+  
+  # Filter by a specific album or library
+  python export_face.py --album-id "your-album-uuid"
+  python export_face.py --library-id "your-library-uuid"
         '''
     )
     
-    parser.add_argument(
-        '--stage1-only', 
-        action='store_true',
-        help='Run only Stage 1: Export face data to JSON file'
-    )
-    
-    parser.add_argument(
-        '--stage2-only',
-        action='store_true', 
-        help='Run only Stage 2: Generate XMP files from existing JSON file'
-    )
-    
-    parser.add_argument(
-        '--direct-xmp',
-        action='store_true',
-        help='Run direct export: query Immich and write XMP sidecars directly (no intermediate JSON stage)'
-    )
-    
-    parser.add_argument(
-        '--json-file',
-        type=str,
-        help='Path to JSON file for Stage 2 (required with --stage2-only)'
-    )
-    
-    parser.add_argument(
-        '--json-dir',
-        type=str,
-        default=None,
-        help='Directory for JSON exports (default: from config)'
-    )
-    
-    parser.add_argument(
-        '--xmp-dir',
-        type=str,
-        default=None,
-        help='Directory for XMP output (default: from config)'
-    )
-    
-    parser.add_argument(
-        '--max-assets',
-        type=int,
-        default=None,
-        help='Maximum number of assets to process (for debugging)'
-    )
+    parser.add_argument('--stage1-only', action='store_true', help='Run only Stage 1: Export face data to JSON file')
+    parser.add_argument('--stage2-only', action='store_true', help='Run only Stage 2: Generate XMP files from existing JSON file')
+    parser.add_argument('--direct-xmp', action='store_true', help='Run direct export: query Immich and write XMP sidecars directly')
+    parser.add_argument('--json-file', type=str, help='Path to JSON file for Stage 2 (required with --stage2-only)')
+    parser.add_argument('--json-dir', type=str, default=None, help='Directory for JSON exports (default: from config)')
+    parser.add_argument('--xmp-dir', type=str, default=None, help='Directory for XMP output (default: from config)')
+    parser.add_argument('--max-assets', type=int, default=None, help='Maximum number of assets to process (for debugging)')
+    parser.add_argument('--album-id', type=str, default=None, help='Process only assets from this specific album ID')
+    parser.add_argument('--library-id', type=str, default=None, help='Process only assets from this specific library ID')
     
     return parser.parse_args()
 
@@ -920,7 +893,7 @@ def main():
     # Direct one-stage export (API -> XMP), no JSON written
     if args.direct_xmp:
         print("\nRunning direct XMP export (single stage): API -> XMP (no intermediate JSON)")
-        success = export_faces_to_xmp(session, access_token, xmp_dir, args.max_assets)
+        success = export_faces_to_xmp(session, access_token, xmp_dir, args.max_assets, args.album_id, args.library_id)
         if success:
             print(f"\n🎉 Direct XMP export completed successfully!")
             print(f"   XMP files: {xmp_dir}")
@@ -929,7 +902,7 @@ def main():
         return
     
     # Stage 1: Export to JSON (default path)
-    json_file_path = export_faces_to_json(session, access_token, json_dir, args.max_assets)
+    json_file_path = export_faces_to_json(session, access_token, json_dir, args.max_assets, args.album_id, args.library_id)
     
     if not json_file_path:
         print("❌ Failed to export face data to JSON")
