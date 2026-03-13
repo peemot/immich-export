@@ -54,7 +54,8 @@ class ConfigLoader:
             'IMMICH_PASSWORD': ['immich', 'password'],
             'IMMICH_REQUEST_TIMEOUT': ['settings', 'request_timeout'],
             'IMMICH_RETRY_ATTEMPTS': ['settings', 'retry_attempts'],
-            'OUTPUT_XMP_DIR': ['output', 'xmp_export_dir']
+            'OUTPUT_XMP_DIR': ['output', 'xmp_export_dir'],
+            'OUTPUT_JSON_DIR': ['output', 'json_export_dir']
         }
         
         for env_var, config_path in env_mappings.items():
@@ -81,24 +82,33 @@ class ConfigLoader:
             current[path[-1]] = value
     
     def get(self, path: str, default: Any = None) -> Any:
-        """Get configuration value using dot notation (e.g., 'immich.base_url')."""
-        keys = path.split('.')
-        current = self.config_data
-        
-        try:
-            for key in keys:
-                current = current[key]
-            return current
-        except (KeyError, TypeError):
-            return default
+        """Get configuration value using dot notation (e.g., 'immich.base_url').
+        Treats explicit JSON nulls as missing (returns default).
+        """
+        keys = path.split(".")
+        current: Any = self.config_data
+        sentinel = object()
+
+        for key in keys:
+            if not isinstance(current, dict):
+                return default
+            current = current.get(key, sentinel)
+            if current is sentinel:
+                return default
+
+        return default if current is None else current
     
     def get_immich_config(self) -> Dict[str, str]:
         """Get Immich connection configuration."""
+        base_url = self.get("immich.base_url", "https://www.blahblah.com")
+        if not base_url:
+            base_url = "https://www.blahblah.com"
+
         return {
-            'base_url': self.get('immich.base_url', 'https://www.blahblah.com'),
-            'api_key': self.get('immich.api_key', ''),
-            'email': self.get('immich.email', ''),
-            'password': self.get('immich.password', '')
+            "base_url": str(base_url),
+            "api_key": str(self.get("immich.api_key", "") or ""),
+            "email": str(self.get("immich.email", "") or ""),
+            "password": str(self.get("immich.password", "") or ""),
         }
     
     def get_output_config(self) -> Dict[str, str]:
@@ -154,7 +164,7 @@ config = ConfigLoader()
 
 # Get configuration from config file
 immich_config = config.get_immich_config()
-IMMICH_BASE_URL = immich_config['base_url'].rstrip('/')
+IMMICH_BASE_URL = str(immich_config["base_url"] or "").rstrip("/")
 IMMICH_API_BASE = f"{IMMICH_BASE_URL}/api"
 output_config = config.get_output_config()
 settings_config = config.get_settings_config()
@@ -287,6 +297,21 @@ def _calculate_unrotated_face_coords(face: Dict[str, Any], orientation_val: int,
     elif orientation_val == 8:  # Rotate 270 CW (Inverse Portrait)
         raw_cx, raw_cy = 1.0 - vis_cy, vis_cx
         raw_fw, raw_fh = vis_fh, vis_fw
+
+    def clamp01(v: float) -> float:
+        # Handle NaN
+        if v != v:
+            return 0.0
+        if v < 0.0:
+            return 0.0
+        if v > 1.0:
+            return 1.0
+        return v
+
+    raw_cx = clamp01(raw_cx)
+    raw_cy = clamp01(raw_cy)
+    raw_fw = clamp01(raw_fw)
+    raw_fh = clamp01(raw_fh)
 
     return raw_cx, raw_cy, raw_fw, raw_fh
 
@@ -453,38 +478,45 @@ def save_xmp_sidecar(original_path: str, xmp_content: str, output_dir: str = "")
     """Save XMP content to sidecar file, creating same directory structure in output_dir."""
     if not xmp_content.strip():
         return False  # Skip empty XMP
-        
+
     try:
-        # Strip leading slashes to prevent Python from jumping to the root drive.
-        clean_path = str(original_path).lstrip('/\\')
-        
+        # Strip leading slashes to prevent jumping to filesystem root.
+        clean_path = str(original_path).lstrip("/\\")
+
         # Strip Windows drive letters (e.g., C:) if they somehow exist
-        if len(clean_path) > 1 and clean_path[1] == ':':
-            clean_path = clean_path[2:].lstrip('/\\')
-            
+        if len(clean_path) > 1 and clean_path[1] == ":":
+            clean_path = clean_path[2:].lstrip("/\\")
+
         original_path_obj = Path(clean_path)
-        filename = original_path_obj.name + '.xmp'
-        
+
+        # Neutralize traversal (..). Without this, output_base / ../../etc can escape.
+        safe_parent_parts = [p for p in original_path_obj.parent.parts if p not in ("..", ".", "")]
+        safe_parent = Path(*safe_parent_parts)
+
+        filename = original_path_obj.name + ".xmp"
+
         if output_dir:
             output_base = Path(output_dir)
-            
-            # Because clean_path has no root, this is guaranteed to stay inside the output_base directory!
-            rel_dir = original_path_obj.parent
-            xmp_path = output_base / rel_dir / filename
-            
-            # Ensure the parent directories exist
+            candidate = output_base / safe_parent / filename
+
+            # Enforce containment even after resolving (handles traversal and symlinks)
+            base_resolved = output_base.resolve(strict=False)
+            xmp_path = candidate.resolve(strict=False)
+
+            if base_resolved != xmp_path and base_resolved not in xmp_path.parents:
+                raise ValueError(f"Refusing to write outside output directory: {xmp_path}")
+
             xmp_path.parent.mkdir(parents=True, exist_ok=True)
         else:
-            # If no output directory, use current directory
             xmp_path = Path(filename)
-        
-        with open(xmp_path, 'w', encoding='utf-8') as f:
+
+        with open(xmp_path, "w", encoding="utf-8") as f:
             f.write(xmp_content)
-        
+
         print(f"    Saved XMP sidecar: {xmp_path}")
         return True
-        
-    except IOError as e:
+
+    except (IOError, ValueError) as e:
         print(f"    Error saving XMP file: {e}")
         return False
 
@@ -503,7 +535,7 @@ def process_assets_with_faces(session: requests.Session, access_token: str, max_
             break
             
         try:
-            # withPeople=True: Ask Immich to ONLY return assets that have detected faces
+            # withPeople=True: ask Immich to INCLUDE people/faces in each returned asset
             # withExif=True: Embed the EXIF data directly in this list response
             search_payload = {
                 "page": page,
@@ -522,8 +554,18 @@ def process_assets_with_faces(session: requests.Session, access_token: str, max_
             search_data = response.json()
             
             # Extract items list
-            assets_data = search_data.get('assets', search_data)
-            items = assets_data.get('items',[])
+            assets_data = search_data.get("assets")
+            if assets_data is None:
+                assets_data = search_data
+
+            if not isinstance(assets_data, dict):
+                print(f"Error: Unexpected search response shape on page {page} (expected dict, got {type(assets_data)})")
+                break
+
+            items = assets_data.get("items") or []
+            if not isinstance(items, list):
+                print(f"Error: Unexpected 'items' type on page {page} (expected list, got {type(items)})")
+                break
             
             if not items:
                 print("  No more items available")
