@@ -5,16 +5,16 @@ Uses search API to get face data.
 Exports face recognition data to XMP format, supported by digiKam, XnView MP and others.
 """
 
+import argparse
+import json
+import os
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, Any, Optional, List, Tuple
+from xml.sax.saxutils import escape as _xml_escape
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-import json
-import os
-import argparse
-from typing import Dict, Any, Optional, List
-from datetime import datetime
-from pathlib import Path
-from xml.sax.saxutils import escape as _xml_escape
 
 
 class ConfigLoader:
@@ -64,7 +64,7 @@ class ConfigLoader:
                 self._set_nested_value(self.config_data, config_path, env_value)
                 print(f"✅ Loaded {env_var} from environment")
     
-    def _set_nested_value(self, data: Dict[str, Any], path: list, value: str) -> None:
+    def _set_nested_value(self, data: Dict[str, Any], path: List[str], value: str) -> None:
         """Set nested dictionary value from path list."""
         current = data
         for key in path[:-1]:
@@ -73,7 +73,7 @@ class ConfigLoader:
             current = current[key]
         
         # Convert numeric values
-        if path[-1] in ['request_timeout', 'retry_attempts']:
+        if path[-1] in['request_timeout', 'retry_attempts']:
             try:
                 current[path[-1]] = int(value)
             except ValueError:
@@ -83,7 +83,6 @@ class ConfigLoader:
     
     def get(self, path: str, default: Any = None) -> Any:
         """Get configuration value using dot notation (e.g., 'immich.base_url').
-        Treats explicit JSON nulls as missing (returns default).
         """
         keys = path.split(".")
         current: Any = self.config_data
@@ -106,9 +105,9 @@ class ConfigLoader:
 
         return {
             "base_url": str(base_url),
-            "api_key": str(self.get("immich.api_key", "") or ""),
-            "email": str(self.get("immich.email", "") or ""),
-            "password": str(self.get("immich.password", "") or ""),
+            "api_key": self.get("immich.api_key", "") or "",
+            "email": self.get("immich.email", "") or "",
+            "password": self.get("immich.password", "") or "",
         }
     
     def get_output_config(self) -> Dict[str, str]:
@@ -159,18 +158,14 @@ class ConfigLoader:
         print(f"   Retry Attempts: {self.get('settings.retry_attempts')}")
 
 
-# Global config loader instance
-config = ConfigLoader()
+# Lazy global config loader
+_CONFIG_INSTANCE: Optional[ConfigLoader] = None
 
-# Get configuration from config file
-immich_config = config.get_immich_config()
-IMMICH_BASE_URL = str(immich_config["base_url"] or "").rstrip("/")
-IMMICH_API_BASE = f"{IMMICH_BASE_URL}/api"
-output_config = config.get_output_config()
-settings_config = config.get_settings_config()
-
-REQUEST_TIMEOUT = settings_config['request_timeout']
-RETRY_ATTEMPTS = settings_config['retry_attempts']
+def get_config() -> ConfigLoader:
+    global _CONFIG_INSTANCE
+    if _CONFIG_INSTANCE is None:
+        _CONFIG_INSTANCE = ConfigLoader()
+    return _CONFIG_INSTANCE
 
 DEFAULT_HEADERS = {
     'Content-Type': 'application/json',
@@ -181,11 +176,11 @@ def create_http_session(retries: int) -> requests.Session:
     """Create a requests session with automatic retries."""
     session = requests.Session()
     retry_strategy = Retry(
-        total=retries,
-        backoff_factor=1,  # Wait 1s, 2s, 4s between retries
-        status_forcelist=[429, 500, 502, 503, 504],
+        total = retries,
+        backoff_factor = 1,  # Wait 1s, 2s, 4s between retries
+        status_forcelist = [429, 500, 502, 503, 504],
         # By default, urllib3 doesn't retry POST requests but Immich search API uses POST.
-        allowed_methods=["HEAD", "GET", "POST", "OPTIONS"] 
+        allowed_methods = ["HEAD", "GET", "POST", "OPTIONS"] 
     )
     adapter = HTTPAdapter(max_retries=retry_strategy)
     session.mount("http://", adapter)
@@ -193,7 +188,14 @@ def create_http_session(retries: int) -> requests.Session:
     return session
 
 
-def api_request(session: requests.Session, method: str, path: str, *, token: str | None = None, **kwargs) -> requests.Response:
+def api_request(session: requests.Session, method: str, path: str, *, token: Optional[str] = None, **kwargs) -> requests.Response:
+    config = get_config()
+    immich_config = config.get_immich_config()
+    settings_config = config.get_settings_config()
+    
+    base_url = immich_config["base_url"].rstrip("/")
+    api_base = f"{base_url}/api"
+    
     headers = DEFAULT_HEADERS.copy()
     api_key = immich_config.get('api_key')
     
@@ -204,9 +206,9 @@ def api_request(session: requests.Session, method: str, path: str, *, token: str
     
     resp = session.request(
         method,
-        f"{IMMICH_API_BASE}{path}",
+        f"{api_base}{path}",
         headers=headers,
-        timeout=REQUEST_TIMEOUT,
+        timeout=settings_config['request_timeout'],
         **kwargs,
     )
     resp.raise_for_status()
@@ -227,32 +229,25 @@ def authenticate(session: requests.Session, email: str, password: str) -> Option
         return None
 
 
-def _parse_orientation(orientation) -> int:
+def _parse_orientation(orientation: Any) -> int:
     """Parse Exif orientation strings or ints into a standard integer 1-8."""
-    if isinstance(orientation, int):
-        return orientation
-        
-    if isinstance(orientation, str):
-        o_lower = str(orientation).lower()
-        if any(x in o_lower for x in['6', 'right top', 'right-top', '90 cw']):
-            return 6
-        elif any(x in o_lower for x in['3', 'bottom right', '180']):
-            return 3
-        elif any(x in o_lower for x in['8', 'left bottom', 'left-bottom', '270 cw']):
-            return 8
-        elif any(x in o_lower for x in['2', 'top right', 'mirror horizontal']):
-            return 2
-        elif any(x in o_lower for x in ['4', 'bottom left', 'mirror vertical']):
-            return 4
-        elif '5' in o_lower:
-            return 5
-        elif '7' in o_lower:
-            return 7
-            
+    if isinstance(orientation, int): return orientation
+    o = str(orientation).lower()
+    if any(x in o for x in['6', 'right top', 'right-top', '90 cw']): return 6
+    if any(x in o for x in ['3', 'bottom right', '180']): return 3
+    if any(x in o for x in ['8', 'left bottom', 'left-bottom', '270 cw']): return 8
+    if any(x in o for x in ['2', 'top right', 'mirror horizontal']): return 2
+    if any(x in o for x in ['4', 'bottom left', 'mirror vertical']): return 4
+    if '5' in o: return 5
+    if '7' in o: return 7
     return 1
 
 
-def _calculate_unrotated_face_coords(face: Dict[str, Any], orientation_val: int, raw_w: int, raw_h: int):
+def _calculate_unrotated_face_coords(
+    face: Dict[str, Any],
+    orientation_val: int,
+    raw_w: int, raw_h: int
+) -> Tuple[float, float, float, float]:
     """Transform Immich visual face coordinates back to raw unrotated space."""
     ml_w = face.get('imageWidth')
     ml_h = face.get('imageHeight')
@@ -411,7 +406,7 @@ def create_xmp_content(asset_data: Dict[str, Any]) -> str:
     lines.append("   <xmp:CreatorTool>Immich Face Export Tool</xmp:CreatorTool>")
 
     # --- General people keywords (dc:subject) ---
-    names =[(p.get("name") or "").strip() for p in people]
+    names = [(p.get("name") or "").strip() for p in people]
     unique_people = sorted({name for name in names if name and name != "Unknown"})
         
     if unique_people:
@@ -521,9 +516,15 @@ def save_xmp_sidecar(original_path: str, xmp_content: str, output_dir: str = "")
         return False
 
 
-def process_assets_with_faces(session: requests.Session, access_token: str, max_assets: Optional[int] = None, album_id: Optional[str] = None, library_id: Optional[str] = None) -> List[Dict[str, Any]]:
+def process_assets_with_faces(
+    session: requests.Session, 
+    access_token: str, 
+    max_assets: Optional[int] = None, 
+    album_id: Optional[str] = None, 
+    library_id: Optional[str] = None
+) -> List[Dict[str, Any]]:
     """Process assets and collect those with face recognition data efficiently."""
-    processed_assets =[]
+    processed_assets = []
     page = 1
     
     print("Collecting assets with faces...")
@@ -619,7 +620,14 @@ def process_assets_with_faces(session: requests.Session, access_token: str, max_
     return processed_assets
 
 
-def export_faces_to_json(session: requests.Session, access_token: str, json_output_dir: str = "json_exports", max_assets: Optional[int] = None, album_id: Optional[str] = None, library_id: Optional[str] = None) -> Optional[str]:
+def export_faces_to_json(
+    session: requests.Session,
+    access_token: str,
+    json_output_dir: str = "json_exports",
+    max_assets: Optional[int] = None,
+    album_id: Optional[str] = None,
+    library_id: Optional[str] = None
+) -> Optional[str]:
     """Export face recognition data to JSON file (Stage 1)."""
     print("Starting face recognition export to JSON format (Stage 1)...")
     
@@ -634,10 +642,12 @@ def export_faces_to_json(session: requests.Session, access_token: str, json_outp
         print("No assets with faces found")
         return None
     
+    base_url = get_config().get_immich_config()["base_url"].rstrip("/")
+    
     # Create comprehensive JSON export
     export_data = {
         'export_timestamp': datetime.now().isoformat(),
-        'immich_server': IMMICH_BASE_URL,
+        'immich_server': base_url,
         'total_assets': len(processed_assets),
         'assets': processed_assets
     }
@@ -802,7 +812,14 @@ def export_faces_to_xmp_from_json(json_file_path: str, output_dir: str = "xmp_si
     return write_xmp_for_assets(processed_assets, output_dir, json_source=json_file_path)
 
 
-def export_faces_to_xmp(session: requests.Session, access_token: str, output_dir: str = "xmp_sidecars", max_assets: Optional[int] = None, album_id: Optional[str] = None, library_id: Optional[str] = None) -> bool:
+def export_faces_to_xmp(
+    session: requests.Session,
+    access_token: str,
+    output_dir: str = "xmp_sidecars",
+    max_assets: Optional[int] = None,
+    album_id: Optional[str] = None,
+    library_id: Optional[str] = None
+) -> bool:
     """
     Direct one-stage export: Immich API -> processed assets -> XMP sidecars (no JSON intermediate).
     """
@@ -816,7 +833,7 @@ def export_faces_to_xmp(session: requests.Session, access_token: str, output_dir
     return write_xmp_for_assets(processed_assets, output_dir)
 
 
-def parse_arguments():
+def parse_arguments() -> argparse.Namespace:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
         description='Export face recognition data from Immich to XMP format',
@@ -863,20 +880,13 @@ def main():
     
     # Validate argument combinations
     if args.stage1_only and args.stage2_only:
-        print("❌ Error: Cannot specify both --stage1-only and --stage2-only")
-        return
-    
+        return print("❌ Error: Cannot specify both --stage1-only and --stage2-only")
     if args.stage2_only and not args.json_file:
-        print("❌ Error: --json-file is required when using --stage2-only")
-        return
+        return print("❌ Error: --json-file is required when using --stage2-only")
+    if args.direct_xmp and (args.stage1_only or args.stage2_only or args.json_file):
+        return print("❌ Error: --direct-xmp cannot be combined with stage args or --json-file")
     
-    if args.direct_xmp and (args.stage1_only or args.stage2_only):
-        print("❌ Error: --direct-xmp cannot be combined with --stage1-only or --stage2-only")
-        return
-
-    if args.direct_xmp and args.json_file:
-        print("❌ Error: --json-file is only used with --stage2-only; do not use it with --direct-xmp")
-        return
+    config = get_config()
     
     # Print configuration summary
     config.print_config_summary()
@@ -906,20 +916,23 @@ def main():
     api_key = immich_config['api_key']
     email = immich_config['email']
     password = immich_config['password']
+    base_url = immich_config['base_url'].rstrip('/')
+    
     output_config = config.get_output_config()
+    settings_config = config.get_settings_config()
     
     # Use custom directories if specified, otherwise use config
     json_dir = args.json_dir or output_config['json_export_dir']
     xmp_dir = args.xmp_dir or output_config['xmp_export_dir']
     
     print("Starting Immich face recognition export...")
-    print(f"Server: {IMMICH_BASE_URL}")
+    print(f"Server: {base_url}")
     print(f"JSON output directory: {json_dir}")
     print(f"XMP output directory: {xmp_dir}")
     if args.max_assets:
         print(f"Maximum assets to process: {args.max_assets}")
     
-    session = create_http_session(RETRY_ATTEMPTS)
+    session = create_http_session(settings_config['retry_attempts'])
     
     # Authenticate
     if api_key:
