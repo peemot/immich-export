@@ -1,82 +1,50 @@
 # Immich Scripts - IFLOW Project Documentation
 
-## Project Overview
+## 📑 Project Overview
 
-This is a Python script for the Immich photo management system, used to export face recognition data from Immich into DigiKam-compatible XMP format files.
+This documentation covers the Python script designed to export face recognition data from the [Immich](https://immich.app/) photo management system into DigiKam-compatible XMP format sidecar files. 
 
-**Main Features:**
-- Retrieve photo assets and face recognition data from Immich API
-- Convert face data into DigiKam-compatible XMP sidecar files
-- Support batch processing and directory structure preservation
-- Support for both API Key (recommended) and Email/Password authentication
-- Provide configuration file management and environment variable support
-- Flexible execution modes (Direct XMP generation or Two-stage JSON->XMP)
-- Filter exports by specific Album or Library IDs
-- Built-in configuration loader (no separate config file needed)
-- Coordinate Translation: Translates Immich's visual ML bounding boxes back to raw, unrotated EXIF coordinates
-- EXIF Preservation: Extracts and embeds Immich EXIF data directly into the generated XMP files.
+### ✨ Core Features
+- **Smart Data Extraction**: Uses Immich's advanced `/search/metadata` API to fetch fully populated assets (including EXIF and People data) in efficient, paginated batches.
+- **DigiKam & Standard Compatibility**: Converts face data into MWG (Metadata Working Group) compliant XMP sidecar files, supported by digiKam, XnView MP, Adobe Lightroom, etc.
+- **Coordinate Translation**: Translates Immich's visual ML bounding boxes back into raw, unrotated EXIF coordinates, perfectly matching the original image canvas.
+- **EXIF Preservation**: Extracts and embeds Immich EXIF data (camera make/model, GPS, exposure, dates) directly into the generated XMP files.
+- **Directory Mirroring**: Output XMP files replicate your original photo library's folder structure for seamless merging.
 
-**Core Technologies:**
-- Python 3.x
-- Requests library for API calls
-- JSON configuration management
-- XMP metadata format processing
+### ⚙️ Flexibility & Execution
+- **Multiple Execution Modes**: Support for Direct memory-to-disk XMP generation, or a Two-stage (JSON dump -> XMP generation) process for auditing.
+- **Granular Filtering**: Filter exports by specific Album IDs or Library IDs.
+- **Built-in Configuration Loader**: No external dependencies needed to parse standard JSON configs or environment variables.
 
-## Project Structure
+### 🔐 Security & Safety
+- **Authentication**: Supports secure API Key authentication (recommended) or legacy Email/Password.
+- **Path Traversal Protection**: Actively neutralizes malicious or malformed `originalPath` references to prevent writing files outside the designated output directory.
+
+---
+
+## 📂 Project Structure
 
 ```text
 /Users/username/immich_scripts/
-├── export_face.py           # Main export script with built-in configuration loader
+├── export_face.py           # Main export script with built-in config loader
 ├── config.json.template     # Configuration template file
-├── json_exports/            # Output directory for Stage-1 JSON dumps
-├── xmp_sidecars/            # Output directory (XMP sidecar files)
-│   └── myphoto/             # Sample photo directory structure
+├── json_exports/            # Default directory for Stage-1 JSON dumps
+├── xmp_sidecars/            # Default directory for generated XMP sidecar files
+│   ├── export_summary.json  # Auto-generated export statistics report
+│   └── myphoto/             # Mirrored sample photo directory structure
 ├── .gitignore               # Git ignore file configuration (includes config.json)
 └── IFLOW.md                 # Project documentation (this file)
 ```
 
-## Core Files Description
+---
 
-### export_face.py
-The main export script that includes:
-- Built-in configuration loader supporting JSON files and environment variables
-- Immich API authentication (API Key or Email/Password)
-- Batch retrieval of photo asset IDs with optional album/library filtering
-- Get detailed face recognition data
-- Generate DigiKam-compatible XMP sidecar files
-- Preserve original directory structure
-- Generate export statistics report
-- Support for CLI arguments to control flow (`--direct-xmp`, `--stage1-only`, etc.)
+## 🛠️ Configuration Management
 
-**Configuration Class Features:**
-- Load configuration from JSON files
-- Support environment variable override
-- Configuration validation and default value handling
-- Support nested configuration path access
-
-### config.json.template
-Configuration template file that provides:
-- Example configuration structure
-- All available configuration options
-- Default values and descriptions
-- Copy this file to `config.json` and customize for your needs
-
-**Main Configuration Items:**
-- `immich.base_url`: Immich server address
-- `immich.api_key`: API key for authentication (Requires `asset.read` permissions)
-- `immich.email`: Login email (used if API key is not provided)
-- `immich.password`: Login password (used if API key is not provided)
-- `settings.request_timeout`: Request timeout in seconds (default: 30)
-- `settings.retry_attempts`: Retry attempts on failure (default: 3)
-- `output.xmp_export_dir`: XMP output directory (default: "xmp_sidecars")
-- `output.json_export_dir`: JSON export directory (default: "json_exports")
-
-## Configuration Management
-
-### Configuration Security
-- **config.json**: Actual configuration file (git-ignored for security)
-- **config.json.template**: Template file with example values
-- **Environment Variables**: Alternative to config.json for sensitive data
+The script uses a flexible configuration hierarchy. Priority is evaluated as follows:
+1. **Command Line Arguments** (Highest priority for paths and execution logic)
+2. **Environment Variables** (Highest priority for credentials & server settings)
+3. **`config.json`** file
+4. **Built-in defaults** (Lowest priority)
 
 ### Setup Instructions
 
@@ -85,7 +53,7 @@ Configuration template file that provides:
    cp config.json.template config.json
    ```
 
-2. **Edit config.json with your actual values:**
+2. **Edit `config.json` with your actual values:**
    ```json
    {
      "immich": {
@@ -104,53 +72,36 @@ Configuration template file that provides:
      }
    }
    ```
-   *Note: Using an `api_key` is recommended. If provided, `email` and `password` are ignored.*
+   > **Note:** Using an `api_key` is highly recommended. If provided, `email` and `password` are ignored. The API key must have at least `asset.read` permissions.
 
-3. **Or use environment variables (recommended for server deployments):**
-   ```bash
-   export IMMICH_BASE_URL="https://your-immich-server.com"
-   export IMMICH_API_KEY="your-api-key"
-   export OUTPUT_XMP_DIR="my_xmp_files"
-   ```
+3. **Or use Environment Variables (ideal for servers/Docker):**
+   * `IMMICH_BASE_URL` mapped to `immich.base_url`
+   * `IMMICH_API_KEY` mapped to `immich.api_key`
+   * `IMMICH_EMAIL` mapped to `immich.email`
+   * `IMMICH_PASSWORD` mapped to `immich.password`
+   * `IMMICH_REQUEST_TIMEOUT` mapped to `settings.request_timeout`
+   * `IMMICH_RETRY_ATTEMPTS` mapped to `settings.retry_attempts`
+   * `OUTPUT_XMP_DIR` mapped to `output.xmp_export_dir`
+   * `OUTPUT_JSON_DIR` mapped to `output.json_export_dir`
 
-### Configuration Priority
-1. Command Line Arguments (for execution logic and paths)
-2. Environment variables (highest priority for credentials/settings)
-3. config.json file
-4. Built-in defaults (lowest priority)
+---
 
-## Usage Instructions
+## 🚀 Usage Instructions
 
 ### 1. Basic Workflow (Two-Stage Default)
-By default, the script fetches data, saves a large JSON payload, and then builds XMP files from it.
+By default, the script fetches data, saves a large JSON payload, and then builds XMP files from that JSON.
 ```bash
 python export_face.py
 ```
-
-After export completion, the configured output directory will contain:
-- XMP sidecar files (preserving original directory structure)
-- `export_summary.json` export statistics report
+*Outputs: XMP sidecars preserving folder structure, and an `export_summary.json` statistics report.*
 
 ### 2. Direct Export (Fastest)
-Query the Immich API and write XMP sidecars directly, skipping the intermediate JSON step.
+Queries the Immich API and writes XMP sidecars directly to disk, skipping the intermediate JSON step.
 ```bash
 python export_face.py --direct-xmp
 ```
 
-### 3. Filtering and Limits
-You can target specific albums/libraries, or limit the number of assets for testing.
-```bash
-# Target a specific album
-python export_face.py --album-id "your-album-uuid"
-
-# Target a specific library
-python export_face.py --library-id "your-library-uuid"
-
-# Process only 50 assets (useful for debugging)
-python export_face.py --max-assets 50
-```
-
-### 4. Split Two-Stage Execution
+### 3. Split Two-Stage Execution
 If you want to save the API dump to JSON first, manually review it, and then generate XMPs later:
 ```bash
 # Stage 1: Export only the JSON
@@ -160,25 +111,43 @@ python export_face.py --stage1-only
 python export_face.py --stage2-only --json-file path/to/export.json
 ```
 
-## Development and Runtime Commands
-
-### Basic Runtime
+### 4. Filtering and Custom Paths
+You can target specific albums/libraries, limit assets for testing, or override output folders.
 ```bash
-# Run main script directly
-python export_face.py
+# Filter by a specific album or library
+python export_face.py --album-id "your-album-uuid"
+python export_face.py --library-id "your-library-uuid"
 
-# The script will automatically load config.json or use environment variables
+# Specify custom output directories
+python export_face.py --json-dir my_json_exports --xmp-dir my_xmp_files
+
+# Process only 50 assets (useful for debugging)
+python export_face.py --max-assets 50
+
+# Enable debug logging for detailed console outputs
+python export_face.py --debug
 ```
 
+---
+
+## 👨‍💻 Development Conventions & Commands
+
+### Code Style
+- Written in Python 3.x using native type annotations (`typing` module).
+- Follows PEP 8 naming conventions (lowercase with underscores for variables/functions, CamelCase for classes).
+- Includes structured error handling: try-except blocks for API exceptions, JSON decoding, and IO operations.
+
 ### Testing and Validation
+Verify your setup or test the script independently using these commands:
+
 ```bash
 # Check Python syntax
 python -m py_compile export_face.py
 
-# Run basic import test
+# Run basic import test to verify ConfigLoader logic
 python -c "from export_face import ConfigLoader; print('Config loader OK')"
 
-# Test with sample configuration
+# Test environment variable overrides
 python -c "
 import os
 os.environ['IMMICH_EMAIL'] = 'test@example.com'
@@ -189,77 +158,41 @@ print('Environment config test OK')
 "
 ```
 
-## Development Conventions
+---
 
-### Code Style
-- Use Python type annotations
-- Follow PEP 8 naming conventions
-- Functions and variables use lowercase with underscores
-- Class names use camel case
+## 🛡️ Security Best Practices & Important Notes
 
-### Error Handling
-- Use try-except for API call exceptions
-- Provide detailed error information and logs
-- Support retry mechanism and timeout settings
+1. **Configuration Security:** Never commit `config.json` to version control (ensure it stays in `.gitignore`).
+2. **Sensitive Data Protection:** Use Environment Variables for production deployments to avoid credential leakage.
+3. **Template Usage:** Keep `config.json.template` updated with new options to act as configuration documentation. Always copy it to `config.json` before editing.
+4. **Path Traversal Shield:** The script strictly enforces paths. If an Immich asset claims to originate from a system-level folder (e.g., `../../etc`), the script neutralizes the traversal attempts and enforces containment within your defined `xmp-dir`.
+5. **API Limits & Retries:** The script paginates at 200 assets per request and auto-retries on 429/5xx status codes. Be mindful of total API load on lower-powered Immich host servers.
 
-### Configuration Management
-- Built-in configuration loader (no separate file needed)
-- Support both JSON files and environment variables
-- Provide reasonable default values
-- Configuration validation and error prompts
-- Template file for easy setup
+---
 
-### Output Format
-- XMP files use UTF-8 encoding
-- Maintain compatibility with DigiKam
-- Generate detailed export statistics
+## 🆘 Troubleshooting
 
-## Important Notes
+* **Authentication Failed:** 
+  Ensure your server URL does *not* end with `/api` (the script handles appending `/api`). If using an API key, confirm it is active and granted the `asset.read` scope.
+* **Empty XMP Files / Missing Tags:** 
+  Ensure your photos have been fully processed for Face Recognition in the Immich administration dashboard. Only assets containing face data will generate an XMP file.
+* **Refusing to Write Outside Directory:** 
+  The script guards against path traversal vulnerabilities. If an Immich asset original path points abnormally outside expected root trees, it will be caught and aborted for that file. Ensure you have write permissions to the targeted output directory.
+* **API Call Failed / Timeout:** 
+  Check network connection and server status. You can increase `IMMICH_REQUEST_TIMEOUT` and `IMMICH_RETRY_ATTEMPTS` via env vars or `config.json` if your server is slow to respond.
+* **Config File Not Found:** 
+  Ensure you copied `config.json.template` to `config.json`. Alternatively, rely completely on Environment Variables.
+* **Script is silent or stuck:**
+  Run the script with `--debug` to get verbose real-time logging of asset processing and pagination steps.
 
-1. **Configuration Security**: Never commit config.json to version control
-2. **API Limits**: Pay attention to Immich API call frequency limits
-3. **Directory Structure**: Output preserves original photo directory structure
-4. **Face Data**: Only photos containing face data will generate XMP files
-5. **Authentication**: Ensure login credentials are correct
-6. **Template Usage**: Always copy config.json.template to config.json before editing
-7. **Permissions**: Ensure your API key has at least `asset.read` permissions.
+---
 
-## Security Best Practices
+## 🔄 Recent Changes
 
-### Sensitive Data Protection
-- config.json is automatically git-ignored
-- Use environment variables for production deployments
-- Never share your config.json file
-- Rotate passwords regularly
-
-### Template Management
-- Keep config.json.template updated with new options
-- Use template as documentation for available settings
-- Document any configuration changes in your deployment
-
-## Troubleshooting
-
-### Common Issues
-- **Authentication Failed**: If using an API key, ensure it is active and has `asset.read`. If using email/password, verify login functionality on the web portal.
-- **Empty XMP Files / Missing Tags**: Ensure your photos have been fully processed for Face Recognition in the Immich administration dashboard.
-- **Refusing to Write Outside Directory**: The script guards against path traversal vulnerabilities. If an Immich asset original path points abnormally outside expected root trees, it will be caught and aborted for that file.
-- **API Call Failed**: Check network connection and server status
-- **Directory Creation Failed**: Check write permissions for output directory
-- **Configuration Errors**: Verify config.json format or environment variables
-- **Config File Not Found**: Ensure you copied config.json.template to config.json
-
-### Log Information
-The script outputs detailed processing information, including:
-- Configuration loading status
-- API call progress
-- File processing statistics
-- Error and warning messages
-
-
-## Recent Changes
-- **Added API Key Authentication**: Script now favors API keys over email/password, improving security.
-- **Added Direct Export Mode**: Skip JSON generation using the `--direct-xmp` flag for faster local syncs.
-- **Added Granular Targeting**: Support for `--album-id` and `--library-id` CLI arguments.
-- **Added Asset Limiting**: Included a `--max-assets` argument for safe testing.
-- **Updated Output Configuration**: Output paths are dynamically controllable via JSON `output.json_export_dir` / `output.xmp_export_dir` or via CLI (`--json-dir`, `--xmp-dir`).
-```
+- **Added debug logging:** Use `--debug` to get verbose real-time logging
+- **Added API Key Authentication:** Script now favors API keys over email/password, vastly improving security.
+- **Added Direct Export Mode:** Skip JSON generation entirely using the `--direct-xmp` flag for faster local syncs.
+- **Added Granular Targeting:** Support for `--album-id` and `--library-id` CLI arguments.
+- **Added Asset Limiting:** Included a `--max-assets` argument for safe testing of large libraries.
+- **Dynamic Output Configuration:** Output paths are fully controllable via JSON (`output.json_export_dir` / `output.xmp_export_dir`) or CLI (`--json-dir`, `--xmp-dir`).
+- **Improved API Efficiency:** Utilizing the `/search/metadata` endpoint allows fetching EXIF and Face bounding boxes inside the same batch, severely reducing overhead API calls.
