@@ -185,4 +185,3 @@ Issues, bug reports, and Pull Requests are always welcome!
 ---
 
 **⭐ If this tool saved you time, please consider giving it a Star on GitHub!**
-```
