@@ -11,7 +11,7 @@ import logging
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Any, Optional, List, Tuple
+from typing import Dict, Any, Optional, List, Tuple, Iterator
 from xml.sax.saxutils import escape as _xml_escape
 import requests
 from requests.adapters import HTTPAdapter
@@ -327,7 +327,30 @@ def _calculate_unrotated_face_coords(
 
 def create_xmp_content(asset_data: Dict[str, Any]) -> str:
     """Create XMP content for face recognition data with EXIF information."""
-    people = asset_data.get("people") or []
+    raw_people = asset_data.get("people") or []
+    people: List[Dict[str, Any]] = []
+
+    for person in raw_people:
+        valid_faces = []
+        for face in (person.get("faces") or []):
+            if all(
+                face.get(key) is not None
+                for key in (
+                    "boundingBoxX1",
+                    "boundingBoxY1",
+                    "boundingBoxX2",
+                    "boundingBoxY2",
+                )
+            ):
+                valid_faces.append(face)
+
+        if not valid_faces:
+            continue
+
+        normalized_person = dict(person)
+        normalized_person["faces"] = valid_faces
+        people.append(normalized_person)
+
     if not people:
         return ""
 
@@ -336,7 +359,8 @@ def create_xmp_content(asset_data: Dict[str, Any]) -> str:
 
     def xml_text(value: Any) -> str:
         """Escape text for safe XML embedding (also safe for attribute values)."""
-        if value is None: return ""
+        if value is None:
+            return ""
         return _xml_escape(str(value), {'"': "&quot;", "'": "&apos;"})
 
     def exif_str(key: str, default: str = "") -> str:
@@ -346,7 +370,8 @@ def create_xmp_content(asset_data: Dict[str, Any]) -> str:
 
     def xmp_date(date_str: str) -> str:
         """Ensure XMP date-time format (adds a dummy time if only date is present)."""
-        if not date_str: return ""
+        if not date_str:
+            return ""
         return date_str if "T" in date_str else f"{date_str}T12:00:00"
 
     def add_tag(lines: List[str], ns_tag: str, value: str, *, allow_empty: bool = False) -> None:
@@ -354,10 +379,37 @@ def create_xmp_content(asset_data: Dict[str, Any]) -> str:
         if value or allow_empty:
             lines.append(f"   <{ns_tag}>{xml_text(value)}</{ns_tag}>")
 
+    def safe_int(value: Any) -> int:
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return 0
+
     # MWG regions must be relative to the UNROTATED (raw) image dimensions.
-    raw_w = int(exif_info.get("exifImageWidth") or asset_data.get("width") or 0)
-    raw_h = int(exif_info.get("exifImageHeight") or asset_data.get("height") or 0)
+    raw_w = safe_int(exif_info.get("exifImageWidth")) or safe_int(asset_data.get("width"))
+    raw_h = safe_int(exif_info.get("exifImageHeight")) or safe_int(asset_data.get("height"))
     orientation_val = _parse_orientation(exif_info.get("orientation"))
+
+    if not raw_w or not raw_h:
+        sample_face = next(
+            (
+                face
+                for person in people
+                for face in (person.get("faces") or [])
+                if safe_int(face.get("imageWidth")) and safe_int(face.get("imageHeight"))
+            ),
+            None,
+        )
+        if sample_face:
+            face_w = safe_int(sample_face.get("imageWidth"))
+            face_h = safe_int(sample_face.get("imageHeight"))
+            if orientation_val in [5, 6, 7, 8]:
+                raw_w, raw_h = face_h, face_w
+            else:
+                raw_w, raw_h = face_w, face_h
+
+    if not raw_w or not raw_h:
+        return ""
 
     lines: List[str] = [
         '<?xml version="1.0" encoding="UTF-8"?>',
@@ -378,29 +430,20 @@ def create_xmp_content(asset_data: Dict[str, Any]) -> str:
         f'   xmp:MetadataDate="{now}">',
     ]
 
-    # --- EXIF / TIFF (camera + lens) ---
     add_tag(lines, "tiff:Make", exif_str("make"))
     add_tag(lines, "tiff:Model", exif_str("model"))
     add_tag(lines, "exif:LensModel", exif_str("lensModel"))
-
-    # --- Exposure settings ---
     add_tag(lines, "exif:FNumber", exif_str("fNumber"))
     add_tag(lines, "exif:ExposureTime", exif_str("exposureTime"))
     add_tag(lines, "exif:ISOSpeedRatings", exif_str("iso"))
     add_tag(lines, "exif:FocalLength", exif_str("focalLength"))
-
-    # --- Image dimensions (raw / unrotated) ---
-    if raw_w and raw_h:
-        add_tag(lines, "tiff:ImageWidth", str(raw_w))
-        add_tag(lines, "tiff:ImageLength", str(raw_h))
-        add_tag(lines, "exif:ExifImageWidth", str(raw_w))
-        add_tag(lines, "exif:ExifImageHeight", str(raw_h))
-
-    # --- Dates ---
+    add_tag(lines, "tiff:ImageWidth", str(raw_w))
+    add_tag(lines, "tiff:ImageLength", str(raw_h))
+    add_tag(lines, "exif:ExifImageWidth", str(raw_w))
+    add_tag(lines, "exif:ExifImageHeight", str(raw_h))
     add_tag(lines, "exif:DateTimeOriginal", xmp_date(exif_str("dateTimeOriginal")))
     add_tag(lines, "exif:DateTimeDigitized", xmp_date(exif_str("dateTimeDigitized")))
 
-    # --- GPS + place names ---
     latitude = exif_str("latitude")
     longitude = exif_str("longitude")
     if latitude and longitude:
@@ -411,22 +454,18 @@ def create_xmp_content(asset_data: Dict[str, Any]) -> str:
     add_tag(lines, "photoshop:State", exif_str("state"))
     add_tag(lines, "photoshop:Country", exif_str("country"))
 
-    # --- File info ---
-    file_name = asset_data.get("file_name", "") or ""
+    file_name = asset_data.get("file_name") or asset_data.get("originalFileName") or ""
     add_tag(lines, "xmp:Identifier", file_name)
     lines.append("   <xmp:CreatorTool>Immich Face Export Tool</xmp:CreatorTool>")
 
-    # --- General people keywords (dc:subject) ---
     names = [(p.get("name") or "").strip() for p in people]
     unique_people = sorted({name for name in names if name and name != "Unknown"})
-        
     if unique_people:
         lines.extend(["   <dc:subject>", "    <rdf:Bag>"])
         for name in unique_people:
             lines.append(f"     <rdf:li>{xml_text(name)}</rdf:li>")
         lines.extend(["    </rdf:Bag>", "   </dc:subject>"])
 
-    # --- Face Regions (MWG) ---
     lines.extend([
         '   <mwg-rs:Regions rdf:parseType="Resource">',
         "    <mwg-rs:AppliedToDimensions",
@@ -437,10 +476,17 @@ def create_xmp_content(asset_data: Dict[str, Any]) -> str:
         "    <rdf:Bag>",
     ])
 
+    regions_written = 0
+
     def add_face_region(person_name: str, face: Dict[str, Any]) -> None:
+        nonlocal regions_written
+
         raw_cx, raw_cy, raw_fw, raw_fh = _calculate_unrotated_face_coords(
             face, orientation_val, raw_w, raw_h
         )
+        if raw_fw <= 0.0 or raw_fh <= 0.0:
+            return
+
         lines.extend([
             "     <rdf:li>",
             "      <rdf:Description",
@@ -455,11 +501,15 @@ def create_xmp_content(asset_data: Dict[str, Any]) -> str:
             "      </rdf:Description>",
             "     </rdf:li>",
         ])
+        regions_written += 1
 
     for person in people:
         person_name = (person.get("name") or "Unknown").strip() or "Unknown"
-        for face in (person.get("faces") or[]):
+        for face in (person.get("faces") or []):
             add_face_region(person_name, face)
+
+    if regions_written == 0:
+        return ""
 
     lines.extend([
         "    </rdf:Bag>",
@@ -521,111 +571,141 @@ def save_xmp_sidecar(original_path: str, xmp_content: str, output_dir: str = "")
 
 
 def process_assets_with_faces(
-    session: requests.Session, 
-    access_token: str, 
-    max_assets: Optional[int] = None, 
-    album_id: Optional[str] = None, 
-    library_id: Optional[str] = None
-) -> List[Dict[str, Any]]:
-    """Process assets and collect those with face recognition data efficiently."""
-    processed_assets = list()
+    session: requests.Session,
+    access_token: str,
+    max_assets: Optional[int] = None,
+    album_id: Optional[str] = None,
+    library_id: Optional[str] = None,
+) -> Iterator[Dict[str, Any]]:
+    """Yield assets that contain at least one valid face region."""
     page = 1
-    progress_interval = 100  # Set how often to report progress in non-debug mode
-    
+    progress_interval = 100
+    yielded_assets = 0
+
     logger.info("   Collecting assets with faces...")
-    
+
     while True:
-        if max_assets is not None and len(processed_assets) >= max_assets:
+        if max_assets is not None and yielded_assets >= max_assets:
             logger.info(f"   Reached maximum asset limit: {max_assets}")
             break
-            
+
         try:
-            # withPeople=True: ask Immich to INCLUDE people/faces in each returned asset
-            # withExif=True: Embed the EXIF data directly in this list response
             search_payload = {
                 "page": page,
-                "size": 200,          # Fetch 200 fully-populated assets at once
-                "withPeople": True,
-                "withExif": True
+                "size": 200,         # Fetch 200 fully-populated assets at once
+                "withPeople": True,  # Ask Immich to INCLUDE people/faces in each returned 
+                "withExif": True,    # Embed the EXIF data directly in this list response
             }
-            
+
             if album_id:
                 search_payload["albumIds"] = [album_id]
             if library_id:
                 search_payload["libraryId"] = library_id
-            
+
             # The search endpoint acts as searchAssets when payload matches metadata parameters
-            response = api_request(session, "POST", "/search/metadata", token=access_token, json=search_payload)
+            response = api_request(
+                session,
+                "POST",
+                "/search/metadata",
+                token=access_token,
+                json=search_payload,
+            )
             search_data = response.json()
-            
-            # Extract items list
+
             assets_data = search_data.get("assets")
             if assets_data is None:
                 assets_data = search_data
 
             if not isinstance(assets_data, dict):
-                logger.error(f"❌ Error: Unexpected search response shape on page {page} (expected dict)")
+                logger.error(
+                    f"❌ Error: Unexpected search response shape on page {page} (expected dict)"
+                )
                 break
 
             items = assets_data.get("items")
             if items is None:
-                items = list()
-                
+                items = []
+
             if not isinstance(items, list):
-                logger.error(f"❌ Error: Unexpected 'items' type on page {page} (expected list)")
+                logger.error(
+                    f"❌ Error: Unexpected 'items' type on page {page} (expected list)"
+                )
                 break
-            
-            if len(items) == 0:
+
+            if not items:
                 break
-                
+
             for item in items:
-                if max_assets is not None and len(processed_assets) >= max_assets:
+                if max_assets is not None and yielded_assets >= max_assets:
                     break
-                    
-                people = item.get("people")
-                if not people:
+
+                raw_people = item.get("people") or []
+                normalized_people: List[Dict[str, Any]] = []
+                total_faces = 0
+
+                for person in raw_people:
+                    valid_faces = []
+                    for face in (person.get("faces") or []):
+                        if all(
+                            face.get(key) is not None
+                            for key in (
+                                "boundingBoxX1",
+                                "boundingBoxY1",
+                                "boundingBoxX2",
+                                "boundingBoxY2",
+                            )
+                        ):
+                            valid_faces.append(face)
+
+                    if not valid_faces:
+                        continue
+
+                    normalized_person = dict(person)
+                    normalized_person["faces"] = valid_faces
+                    normalized_people.append(normalized_person)
+                    total_faces += len(valid_faces)
+
+                if not normalized_people:
                     continue
-                
-                # Logic for logging
-                asset_num = len(processed_assets) + 1
+
+                yielded_assets += 1
                 file_name = item.get("originalFileName", "Unknown")
-                
-                # 1. DEBUG LOGGING: Detailed per-asset info
+
                 if logger.isEnabledFor(logging.DEBUG):
-                    total_faces = sum(len(p.get("faces") or []) for p in people)
-                    logger.debug(f"Asset {asset_num}: {file_name} - {len(people)} people, {total_faces} faces")
-                
-                # 2. INFO LOGGING: Progress every N assets (only if NOT in debug mode)
-                elif asset_num % progress_interval == 0:
-                    logger.info(f"   Progress: Found {asset_num} assets with faces...")
-                
-                asset_info = {
+                    logger.debug(
+                        f"Asset {yielded_assets}: {file_name} - "
+                        f"{len(normalized_people)} people, {total_faces} faces"
+                    )
+                elif progress_interval and yielded_assets % progress_interval == 0:
+                    logger.info(f"   Progress: Found {yielded_assets} assets with faces...")
+
+                yield {
                     "asset_id": item.get("id", ""),
                     "original_path": item.get("originalPath", ""),
                     "file_name": file_name,
-                    "exifInfo": item.get("exifInfo", dict()),
-                    "people": people
+                    "width": item.get("width"),
+                    "height": item.get("height"),
+                    "exifInfo": item.get("exifInfo") or {},
+                    "people": normalized_people,
                 }
-                
-                processed_assets.append(asset_info)
-            
-            # Reduce verbosity of "Page processed" if not in debug mode
+
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(f"Finished processing page {page}")
-            
+
             next_page = assets_data.get("nextPage")
-            if not next_page: break
+            if not next_page:
+                break
+
             try:
                 page = int(next_page)
             except (ValueError, TypeError):
                 page += 1
-                
+
         except Exception as e:
             logger.error(f"❌ Error collecting assets on page {page}: {e}")
             break
-            
-    logger.info(f"✅ Processing completed: Found {len(processed_assets)} assets with faces")
-    return processed_assets
+
+    logger.info(f"✅ Processing completed: Found {yielded_assets} assets with faces")
 
 
 def export_faces_to_json(
@@ -636,50 +716,82 @@ def export_faces_to_json(
     album_id: Optional[str] = None,
     library_id: Optional[str] = None
 ) -> Optional[str]:
-    """Export face recognition data to JSON file (Stage 1)."""
+    """Export face recognition data to JSON file (Stage 1) without holding the full library in memory."""
     logger.info("\n   Starting face recognition export to JSON format (Stage 1)...")
-    
-    # Create output directory
+
     output_path = Path(json_output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
-    
-    # Process assets with faces
-    processed_assets = process_assets_with_faces(session, access_token, max_assets, album_id, library_id)
-    
-    if not processed_assets:
-        logger.warning("No assets with faces found")
-        return None
-    
-    base_url = get_config().get_immich_config()["base_url"].rstrip("/")
-    
-    # Create comprehensive JSON export
-    export_data = {
-        'export_timestamp': datetime.now().isoformat(),
-        'immich_server': base_url,
-        'total_assets': len(processed_assets),
-        'assets': processed_assets
-    }
-    
-    # Generate filename with timestamp
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     json_filename = f"immich_faces_export_{timestamp}.json"
     json_file_path = output_path / json_filename
-    
+    assets_tmp_path = output_path / f".{json_filename}.assets.tmp"
+
+    base_url = get_config().get_immich_config()["base_url"].rstrip("/")
+    total_assets = 0
+
     try:
-        with open(json_file_path, 'w', encoding='utf-8') as f:
-            json.dump(export_data, f, indent=2, ensure_ascii=False)
-        
+        with open(assets_tmp_path, "w", encoding="utf-8") as assets_file:
+            first_asset = True
+
+            for asset_info in process_assets_with_faces(
+                session,
+                access_token,
+                max_assets,
+                album_id,
+                library_id,
+            ):
+                if not first_asset:
+                    assets_file.write(",\n")
+                json.dump(asset_info, assets_file, ensure_ascii=False, separators=(",", ":"))
+                first_asset = False
+                total_assets += 1
+
+        if total_assets == 0:
+            logger.warning("No assets with faces found")
+            return None
+
+        export_timestamp = datetime.now().isoformat()
+
+        with open(json_file_path, "w", encoding="utf-8") as out_file, open(
+            assets_tmp_path, "r", encoding="utf-8"
+        ) as assets_file:
+            out_file.write("{\n")
+            out_file.write(
+                f'  "export_timestamp": {json.dumps(export_timestamp, ensure_ascii=False)},\n'
+            )
+            out_file.write(
+                f'  "immich_server": {json.dumps(base_url, ensure_ascii=False)},\n'
+            )
+            out_file.write(f'  "total_assets": {total_assets},\n')
+            out_file.write('  "assets": [\n')
+
+            while True:
+                chunk = assets_file.read(1024 * 1024)
+                if not chunk:
+                    break
+                out_file.write(chunk)
+
+            out_file.write("\n  ]\n}\n")
+
         json_file_path_abs = json_file_path.absolute()
-        logger.info(f"✅ JSON export completed!")
-        logger.info(f"\n📊 Statistics:")
-        logger.info(f"   Total assets with faces: {len(processed_assets)}")
+        logger.info("✅ JSON export completed!")
+        logger.info("\n📊 Statistics:")
+        logger.info(f"   Total assets with faces: {total_assets}")
         logger.info(f"   JSON file: {json_file_path_abs}")
-        
+
         return str(json_file_path_abs)
-        
+
     except IOError as e:
         logger.error(f"❌ Error saving JSON file: {e}")
         return None
+
+    finally:
+        try:
+            if assets_tmp_path.exists():
+                assets_tmp_path.unlink()
+        except OSError:
+            pass
 
 
 def write_xmp_for_assets(
@@ -828,15 +940,93 @@ def export_faces_to_xmp(
     album_id: Optional[str] = None,
     library_id: Optional[str] = None
 ) -> bool:
-    """Direct one-stage export: Immich API -> processed assets -> XMP sidecars (no JSON intermediate)."""
+    """Direct one-stage export: stream Immich API results straight to XMP sidecars."""
     logger.info("   Starting DIRECT face recognition export to XMP format (API -> XMP, no JSON)...")
 
-    processed_assets = process_assets_with_faces(session, access_token, max_assets, album_id, library_id)
-    if not processed_assets:
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    total_assets = 0
+    total_files_created = 0
+    total_faces_processed = 0
+    person_stats: Dict[str, int] = {}
+
+    logger.info(f"   Output directory: {output_path.absolute()}")
+
+    for asset_data in process_assets_with_faces(
+        session,
+        access_token,
+        max_assets,
+        album_id,
+        library_id,
+    ):
+        total_assets += 1
+        people_data = asset_data.get("people") or []
+        file_label = asset_data.get("file_name") or asset_data.get("originalFileName") or "Unknown"
+
+        xmp_content = create_xmp_content(asset_data)
+        if not xmp_content.strip():
+            logger.warning(f"   Warning: Empty XMP content for asset {file_label}")
+            continue
+
+        asset_id = asset_data.get("asset_id") or asset_data.get("id") or f"idx_{total_assets}"
+        original_path = (
+            asset_data.get("original_path")
+            or asset_data.get("originalPath")
+            or f"unknown_{asset_id}.jpg"
+        )
+
+        if save_xmp_sidecar(original_path, xmp_content, str(output_path)):
+            total_files_created += 1
+
+            for person in people_data:
+                person_name = (person.get("name") or "Unknown").strip() or "Unknown"
+                face_count = len(person.get("faces") or [])
+                if face_count <= 0:
+                    continue
+                total_faces_processed += face_count
+                person_stats[person_name] = person_stats.get(person_name, 0) + face_count
+
+    if total_assets == 0:
         logger.warning("No assets with faces found")
         return False
 
-    return write_xmp_for_assets(processed_assets, output_dir)
+    summary_file = output_path / "export_summary.json"
+    summary_data: Dict[str, Any] = {
+        "export_timestamp": datetime.now().isoformat(),
+        "total_assets": total_assets,
+        "total_xmp_files_created": total_files_created,
+        "total_faces_processed": total_faces_processed,
+        "unique_people": len(person_stats),
+        "people_statistics": person_stats,
+        "output_directory": str(output_path.absolute()),
+    }
+
+    try:
+        with open(summary_file, "w", encoding="utf-8") as f:
+            json.dump(summary_data, f, indent=2, ensure_ascii=False)
+    except IOError as e:
+        logger.error(f"❌ Error saving summary file: {e}")
+
+    logger.info("✅ XMP export completed!")
+    logger.info("\n📊 Statistics:")
+    logger.info(f"   Total assets processed: {total_assets}")
+    logger.info(f"   XMP sidecar files created: {total_files_created}")
+    logger.info(f"   Total faces processed: {total_faces_processed}")
+    logger.info(f"   Unique people: {len(person_stats)}")
+    logger.info(f"   Output directory: {output_path.absolute()}")
+    logger.info(f"   Summary file: {summary_file.absolute()}")
+
+    if person_stats:
+        logger.info("\n👥 People found (top 10):")
+        for person, count in sorted(person_stats.items(), key=lambda x: x[1], reverse=True)[:10]:
+            logger.info(f"   {person}: {count} faces")
+
+    if total_files_created == 0:
+        logger.error("\n❌ No XMP files were created (all assets were skipped or writes failed).")
+        return False
+
+    return True
 
 
 def parse_arguments() -> argparse.Namespace:
