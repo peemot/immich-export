@@ -1,6 +1,6 @@
 # Immich Face Recognition Export Tool
 
-[![Python 3.x](https://img.shields.io/badge/Python-3.x-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.6+](https://img.shields.io/badge/Python-3.6+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 A Python tool to securely export face recognition data from your [Immich](https://immich.app/) photo management system into standard XMP sidecar files.
@@ -8,13 +8,17 @@ A Python tool to securely export face recognition data from your [Immich](https:
 ## 🌟 Features
 
 - **🔍 Face Data Extraction**: Retrieves face recognition bounding boxes and labels directly from the Immich API.
-- **🎯 Highly Compatible**: Generates standard XMP sidecar files utilizing MWG (Metadata Working Group) region tags, making them compatible with digiKam, XnView MP, Adobe Lightroom, and other photo management software.
-- **🔄 Smart Coordinate Transformation**: Automatically handles image rotation/orientation EXIF data, converting Immich's visual coordinates back to the raw image's coordinate space.
-- **📁 Preserves Directory Structure**: Output XMP files replicate your original photo library's folder structure for easy merging.
+- **🎯 Highly Compatible**: MWG-compliant XMP sidecars for digiKam, XnView MP, and other photo management software.
+- **🔄 Coordinate Transformation**: Automatically handles orientation EXIF data to ensure compatibility with other tools.
+- **📁 Preserves Directory Structure**: Replicates your library structure for seamless sidecar merging.
 - **🔑 Secure Authentication**: Supports both Immich API Keys (recommended) and Email/Password login.
-- **🚀 Flexible Processing Modes**: Run a direct memory-to-disk export (`--direct-xmp`) or use a two-stage process (saving intermediate JSON) to review data before generating XMP files.
+- **🚀 Flexible Workflow**: Choose direct XMP export (`--direct-xmp`) or a two-stage JSON-to-XMP process (default).
 - **🗂️ Targeted Exports**: Filter exported assets by specific `album-id` or `library-id`.
-- **🚀 Efficient Processing** - Smart batch processing, supports large photo libraries
+- **🚀 Efficient Processing** - Smart batch processing, supports large photo libraries.
+
+## Prerequisites
+1. **Python 3.6+**
+2. **Immich:** Immich v1.100.0 or newer.
 
 ## 🚀 Quick Start
 
@@ -26,7 +30,7 @@ cd immich-export
 
 ### 2. Install Dependencies
 ```bash
-pip install requests urllib3
+pip install requests
 ```
 
 ### 3. Configuration
@@ -174,9 +178,6 @@ For complete project documentation, please refer to [IFLOW.md](IFLOW.md), which 
 - 🛡️ Security best practices
 - 📋 Detailed feature descriptions
 
-## 📄 License
-
-MIT License - See the [LICENSE](LICENSE) file for details.
 
 ## 🤝 Contributing
 
