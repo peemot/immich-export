@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Face recognition export script for Immich.
+XMP export script for Immich.
 Uses search API to get face data.
-Exports face recognition data to XMP format, supported by digiKam, XnView MP and others.
+Exports asset metadata to XMP format, supported by digiKam, XnView MP and others.
 """
 
 import argparse
@@ -367,12 +367,9 @@ def _extract_search_page_items(search_data: Any, page: int) -> Tuple[List[Dict[s
     return items, assets_data.get("nextPage")
 
 
-def create_xmp_content(asset_data: Dict[str, Any]) -> str:
-    """Create XMP content for face recognition data with EXIF information."""
+def create_xmp_content(asset_data: Dict[str, Any], require_face_regions: bool = False) -> str:
+    """Create XMP content for asset metadata and optional face recognition data."""
     people = normalize_people(asset_data.get("people"))
-    if not people:
-        return ""
-
     exif_info = asset_data.get("exifInfo") or {}
     now = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
 
@@ -417,7 +414,7 @@ def create_xmp_content(asset_data: Dict[str, Any]) -> str:
             # If the ML canvas was sideways, flip back to the raw image orientation.
             raw_w, raw_h = (face_h, face_w) if orientation_val in [5, 6, 7, 8] else (face_w, face_h)
 
-    if not raw_w or not raw_h:
+    if require_face_regions and (not people or not raw_w or not raw_h):
         return ""
 
     lines = f"""<?xml version="1.0" encoding="UTF-8"?>
@@ -452,14 +449,19 @@ def create_xmp_content(asset_data: Dict[str, Any]) -> str:
         add_tag(lines, tag, exif_str(key))
 
     for tag, value in (
-        ("tiff:ImageWidth", raw_w),
-        ("tiff:ImageLength", raw_h),
-        ("exif:ExifImageWidth", raw_w),
-        ("exif:ExifImageHeight", raw_h),
         ("exif:DateTimeOriginal", xmp_date(exif_str("dateTimeOriginal"))),
         ("exif:DateTimeDigitized", xmp_date(exif_str("dateTimeDigitized"))),
     ):
         add_tag(lines, tag, str(value))
+
+    if raw_w and raw_h:
+        for tag, value in (
+            ("tiff:ImageWidth", raw_w),
+            ("tiff:ImageLength", raw_h),
+            ("exif:ExifImageWidth", raw_w),
+            ("exif:ExifImageHeight", raw_h),
+        ):
+            add_tag(lines, tag, str(value))
 
     latitude = exif_str("latitude")
     longitude = exif_str("longitude")
@@ -469,7 +471,7 @@ def create_xmp_content(asset_data: Dict[str, Any]) -> str:
 
     file_name = asset_data.get("file_name") or asset_data.get("originalFileName") or ""
     add_tag(lines, "xmp:Identifier", file_name)
-    lines.append("   <xmp:CreatorTool>Immich Face Export Tool</xmp:CreatorTool>")
+    lines.append("   <xmp:CreatorTool>Immich XMP Export Tool</xmp:CreatorTool>")
 
     unique_people = sorted({(person.get("name") or "").strip() for person in people} - {"", "Unknown"})
     if unique_people:
@@ -477,51 +479,56 @@ def create_xmp_content(asset_data: Dict[str, Any]) -> str:
         lines.extend(f"     <rdf:li>{xml_text(name)}</rdf:li>" for name in unique_people)
         lines.extend(["    </rdf:Bag>", "   </dc:subject>"])
 
-    lines.extend(
-        [
-            '   <mwg-rs:Regions rdf:parseType="Resource">',
-            "    <mwg-rs:AppliedToDimensions",
-            f'     stDim:w="{raw_w}"',
-            f'     stDim:h="{raw_h}"',
-            '     stDim:unit="pixel"/>',
-            "    <mwg-rs:RegionList>",
-            "    <rdf:Bag>",
-        ]
-    )
+    if people and raw_w and raw_h:
+        lines.extend(
+            [
+                '   <mwg-rs:Regions rdf:parseType="Resource">',
+                "    <mwg-rs:AppliedToDimensions",
+                f'     stDim:w="{raw_w}"',
+                f'     stDim:h="{raw_h}"',
+                '     stDim:unit="pixel"/>',
+                "    <mwg-rs:RegionList>",
+                "    <rdf:Bag>",
+            ]
+        )
 
-    regions_written = 0
-    for person in people:
-        person_name = (person.get("name") or "Unknown").strip() or "Unknown"
-        for face in person.get("faces") or []:
-            raw_cx, raw_cy, raw_fw, raw_fh = _calculate_unrotated_face_coords(face, orientation_val, raw_w, raw_h)
-            if raw_fw <= 0.0 or raw_fh <= 0.0:
-                continue
-            lines.extend(
-                [
-                    "     <rdf:li>",
-                    "      <rdf:Description",
-                    f'       mwg-rs:Name="{xml_text(person_name)}"',
-                    '       mwg-rs:Type="Face">',
-                    "       <mwg-rs:Area",
-                    f'        stArea:x="{raw_cx:.6f}"',
-                    f'        stArea:y="{raw_cy:.6f}"',
-                    f'        stArea:w="{raw_fw:.6f}"',
-                    f'        stArea:h="{raw_fh:.6f}"',
-                    '        stArea:unit="normalized"/>',
-                    "      </rdf:Description>",
-                    "     </rdf:li>",
-                ]
-            )
-            regions_written += 1
+        regions_written = 0
+        for person in people:
+            person_name = (person.get("name") or "Unknown").strip() or "Unknown"
+            for face in person.get("faces") or []:
+                raw_cx, raw_cy, raw_fw, raw_fh = _calculate_unrotated_face_coords(face, orientation_val, raw_w, raw_h)
+                if raw_fw <= 0.0 or raw_fh <= 0.0:
+                    continue
+                lines.extend(
+                    [
+                        "     <rdf:li>",
+                        "      <rdf:Description",
+                        f'       mwg-rs:Name="{xml_text(person_name)}"',
+                        '       mwg-rs:Type="Face">',
+                        "       <mwg-rs:Area",
+                        f'        stArea:x="{raw_cx:.6f}"',
+                        f'        stArea:y="{raw_cy:.6f}"',
+                        f'        stArea:w="{raw_fw:.6f}"',
+                        f'        stArea:h="{raw_fh:.6f}"',
+                        '        stArea:unit="normalized"/>',
+                        "      </rdf:Description>",
+                        "     </rdf:li>",
+                    ]
+                )
+                regions_written += 1
 
-    if regions_written == 0:
-        return ""
+        if require_face_regions and regions_written == 0:
+            return ""
 
-    lines.extend(
-        """    </rdf:Bag>
+        lines.extend(
+            """    </rdf:Bag>
     </mwg-rs:RegionList>
    </mwg-rs:Regions>
-  </rdf:Description>
+""".splitlines()
+        )
+
+    lines.extend(
+        """  </rdf:Description>
  </rdf:RDF>
 </x:xmpmeta>
 """.splitlines()
@@ -571,19 +578,20 @@ def save_xmp_sidecar(original_path: str, xmp_content: str, output_dir: str = "")
         return False
 
 
-def process_assets_with_faces(
+def process_assets(
     session: requests.Session,
     access_token: Optional[str] = None,
     max_assets: Optional[int] = None,
     album_id: Optional[str] = None,
     library_id: Optional[str] = None,
+    faces_only: bool = False,
 ) -> Iterator[Dict[str, Any]]:
-    """Yield assets that contain at least one valid face region."""
+    """Yield assets, optionally limited to those that contain at least one valid face region."""
     page = 1
     progress_interval = 100
     yielded_assets = 0
 
-    logger.info("   Collecting assets with faces...")
+    logger.info("   Collecting assets with faces..." if faces_only else "   Collecting assets...")
 
     while True:
         if max_assets is not None and yielded_assets >= max_assets:
@@ -621,7 +629,7 @@ def process_assets_with_faces(
                     break
 
                 normalized_people = normalize_people(item.get("people"))
-                if not normalized_people:
+                if faces_only and not normalized_people:
                     continue
 
                 yielded_assets += 1
@@ -634,7 +642,7 @@ def process_assets_with_faces(
                         f"{len(normalized_people)} people, {total_faces} faces"
                     )
                 elif progress_interval and yielded_assets % progress_interval == 0:
-                    logger.info(f"   Progress: Found {yielded_assets} assets with faces...")
+                    logger.info(f"   Progress: Found {yielded_assets} {'assets with faces' if faces_only else 'assets'}...")
 
                 yield {
                     "asset_id": item.get("id", ""),
@@ -660,25 +668,26 @@ def process_assets_with_faces(
             logger.error(f"❌ Error collecting assets on page {page}: {e}")
             break
 
-    logger.info(f"✅ Processing completed: Found {yielded_assets} assets with faces")
+    logger.info(f"✅ Processing completed: Found {yielded_assets} {'assets with faces' if faces_only else 'assets'}")
 
 
-def export_faces_to_json(
+def export_assets_to_json(
     session: requests.Session,
     access_token: Optional[str] = None,
     json_output_dir: str = "json_exports",
     max_assets: Optional[int] = None,
     album_id: Optional[str] = None,
     library_id: Optional[str] = None,
+    faces_only: bool = False,
 ) -> Optional[str]:
-    """Export face recognition data to JSON file (Stage 1) without holding the full library in memory."""
-    logger.info("\n   Starting face recognition export to JSON format (Stage 1)...")
+    """Export asset data to JSON file (Stage 1) without holding the full library in memory."""
+    logger.info("\n   Starting export to JSON format (Stage 1)...")
 
     output_path = Path(json_output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    json_filename = f"immich_faces_export_{timestamp}.json"
+    json_filename = f"immich_assets_export_{timestamp}.json"
     json_file_path = output_path / json_filename
     assets_tmp_path = output_path / f".{json_filename}.assets.tmp"
 
@@ -686,7 +695,7 @@ def export_faces_to_json(
     try:
         with open(assets_tmp_path, "w", encoding="utf-8") as assets_file:
             first_asset = True
-            for asset_info in process_assets_with_faces(session, access_token, max_assets, album_id, library_id):
+            for asset_info in process_assets(session, access_token, max_assets, album_id, library_id, faces_only):
                 if not first_asset:
                     assets_file.write(",\n")
                 json.dump(asset_info, assets_file, ensure_ascii=False, separators=(",", ":"))
@@ -694,7 +703,7 @@ def export_faces_to_json(
                 total_assets += 1
 
         if total_assets == 0:
-            logger.warning("No assets with faces found")
+            logger.warning("No matching assets found")
             return None
 
         with open(json_file_path, "w", encoding="utf-8") as out_file, open(assets_tmp_path, "r", encoding="utf-8") as assets_file:
@@ -713,7 +722,7 @@ def export_faces_to_json(
         json_file_path_abs = json_file_path.absolute()
         logger.info("✅ JSON export completed!")
         logger.info("\n📊 Statistics:")
-        logger.info(f"   Total assets with faces: {total_assets}")
+        logger.info(f"   Total assets exported: {total_assets}")
         logger.info(f"   JSON file: {json_file_path_abs}")
         return str(json_file_path_abs)
     except IOError as e:
@@ -735,6 +744,7 @@ def write_xmp_for_assets(
     json_source: Optional[str] = None,
     progress_every: int = 500,
     top_people_to_print: int = 10,
+    faces_only: bool = False,
 ) -> bool:
     """
     Take processed assets and write XMP sidecars + a summary file.
@@ -752,39 +762,36 @@ def write_xmp_for_assets(
     person_stats: Dict[str, int] = {}
 
     count_label = f"for {total_assets} assets" if total_assets else "for streamed assets"
-    logger.info(f"\n   Creating XMP files {count_label} with faces...")
+    logger.info(f"\n   Creating XMP files {count_label}...")
     logger.info(f"   Output directory: {output_path.absolute()}")
 
     for processed_count, asset_data in enumerate(assets, 1):
         people_data = asset_data.get("people") or []
         file_label = asset_data.get("file_name") or asset_data.get("originalFileName") or "Unknown"
 
-        if not people_data:
-            logger.warning(f"   Warning: No people data for asset {file_label}")
+        xmp_content = create_xmp_content(asset_data, faces_only)
+        if not xmp_content.strip():
+            logger.warning(f"   Warning: Empty XMP content for asset {file_label}")
         else:
-            xmp_content = create_xmp_content(asset_data)
-            if not xmp_content.strip():
-                logger.warning(f"   Warning: Empty XMP content for asset {file_label}")
-            else:
-                asset_id = asset_data.get("asset_id") or asset_data.get("id") or f"idx_{processed_count}"
-                original_path = asset_data.get("original_path") or asset_data.get("originalPath") or f"unknown_{asset_id}.jpg"
+            asset_id = asset_data.get("asset_id") or asset_data.get("id") or f"idx_{processed_count}"
+            original_path = asset_data.get("original_path") or asset_data.get("originalPath") or f"unknown_{asset_id}.jpg"
 
-                if save_xmp_sidecar(original_path, xmp_content, str(output_path)):
-                    total_files_created += 1
-                    for person in people_data:
-                        face_count = len(person.get("faces") or [])
-                        if face_count <= 0:
-                            continue
-                        person_name = (person.get("name") or "Unknown").strip() or "Unknown"
-                        total_faces_processed += face_count
-                        person_stats[person_name] = person_stats.get(person_name, 0) + face_count
+            if save_xmp_sidecar(original_path, xmp_content, str(output_path)):
+                total_files_created += 1
+                for person in people_data:
+                    face_count = len(person.get("faces") or [])
+                    if face_count <= 0:
+                        continue
+                    person_name = (person.get("name") or "Unknown").strip() or "Unknown"
+                    total_faces_processed += face_count
+                    person_stats[person_name] = person_stats.get(person_name, 0) + face_count
 
         if progress_every and processed_count % progress_every == 0:
             suffix = f"/{total_assets}" if total_assets else ""
             logger.info(f"   Progress: {processed_count}{suffix} assets processed")
 
     if processed_count == 0:
-        logger.warning("No assets with faces found")
+        logger.warning("No assets found")
         return False
 
     summary_file = output_path / "export_summary.json"
@@ -827,9 +834,13 @@ def write_xmp_for_assets(
     return True
 
 
-def export_faces_to_xmp_from_json(json_file_path: str, output_dir: str = "xmp_sidecars") -> bool:
-    """Export face recognition data to XMP format from JSON file (Stage 2)."""
-    logger.info("   Starting face recognition export to XMP format from JSON file (Stage 2)...")
+def export_assets_to_xmp_from_json(
+    json_file_path: str,
+    output_dir: str = "xmp_sidecars",
+    faces_only: bool = False,
+) -> bool:
+    """Export asset data to XMP format from JSON file (Stage 2)."""
+    logger.info("   Starting export to XMP format from JSON file (Stage 2)...")
     logger.info(f"   JSON source: {Path(json_file_path).absolute()}")
 
     try:
@@ -840,8 +851,10 @@ def export_faces_to_xmp_from_json(json_file_path: str, output_dir: str = "xmp_si
         return False
 
     processed_assets = export_data.get("assets") or []
+    if faces_only:
+        processed_assets = [asset for asset in processed_assets if normalize_people(asset.get("people"))]
     if not processed_assets:
-        logger.warning("No assets found in JSON file")
+        logger.warning("No matching assets found in JSON file")
         return False
 
     logger.info(f"   Loaded {len(processed_assets)} assets from JSON file")
@@ -850,58 +863,65 @@ def export_faces_to_xmp_from_json(json_file_path: str, output_dir: str = "xmp_si
         output_dir,
         total_assets=len(processed_assets),
         json_source=json_file_path,
+        faces_only=faces_only,
     )
 
 
-def export_faces_to_xmp(
+def export_assets_to_xmp(
     session: requests.Session,
     access_token: Optional[str] = None,
     output_dir: str = "xmp_sidecars",
     max_assets: Optional[int] = None,
     album_id: Optional[str] = None,
     library_id: Optional[str] = None,
+    faces_only: bool = False,
 ) -> bool:
     """Direct one-stage export: stream Immich API results straight to XMP sidecars."""
-    logger.info("   Starting DIRECT face recognition export to XMP format (API -> XMP, no JSON)...")
+    logger.info("   Starting DIRECT export to XMP format (API -> XMP, no JSON)...")
     return write_xmp_for_assets(
-        process_assets_with_faces(session, access_token, max_assets, album_id, library_id),
+        process_assets(session, access_token, max_assets, album_id, library_id, faces_only),
         output_dir,
+        faces_only=faces_only,
     )
 
 
 def parse_arguments() -> argparse.Namespace:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
-        description="Export face recognition data from Immich to XMP format",
+        description="Export Immich asset metadata and optional face recognition data to XMP format",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   # Run both stages (default): Export to JSON then generate XMP
-  python export_face.py
+  python export_xmp.py
 
   # Run direct one-stage export (no JSON file written)
-  python export_face.py --direct-xmp
+  python export_xmp.py --direct-xmp
+
+  # Export only assets with faces (legacy behavior)
+  python export_xmp.py --faces-only
 
   # Run only Stage 1: Export to JSON file
-  python export_face.py --stage1-only
+  python export_xmp.py --stage1-only
 
   # Run only Stage 2: Generate XMP from existing JSON file
-  python export_face.py --stage2-only --json-file path/to/export.json
+  python export_xmp.py --stage2-only --json-file path/to/export.json
 
   # Specify custom output directories
-  python export_face.py --json-dir my_json_exports --xmp-dir my_xmp_files
+  python export_xmp.py --json-dir my_json_exports --xmp-dir my_xmp_files
 
   # Filter by a specific album or library
-  python export_face.py --album-id "your-album-uuid"
-  python export_face.py --library-id "your-library-uuid"
+  python export_xmp.py --album-id "your-album-uuid"
+  python export_xmp.py --library-id "your-library-uuid"
         """,
     )
 
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--stage1-only", action="store_true", help="Run only Stage 1: Export face data to JSON file")
+    mode.add_argument("--stage1-only", action="store_true", help="Run only Stage 1: Export asset data to JSON file")
     mode.add_argument("--stage2-only", action="store_true", help="Run only Stage 2: Generate XMP files from existing JSON file")
     mode.add_argument("--direct-xmp", action="store_true", help="Run direct export: query Immich and write XMP sidecars directly")
 
+    parser.add_argument("--faces-only", action="store_true", help="Export only assets that contain at least one valid face region")
     parser.add_argument("--json-file", type=str, help="Path to JSON file for Stage 2 (required with --stage2-only)")
     parser.add_argument("--json-dir", type=str, default=None, help="Directory for JSON exports (default: from config)")
     parser.add_argument("--xmp-dir", type=str, default=None, help="Directory for XMP output (default: from config)")
@@ -919,14 +939,14 @@ Examples:
 
 
 def main() -> None:
-    """Main function to export face recognition data with two-stage processing."""
+    """Main function to export asset metadata with two-stage processing."""
     args = parse_arguments()
     setup_logging(args.debug)
 
     if args.stage2_only:
         logger.info("Running Stage 2 only: Generate XMP from JSON file")
         xmp_dir = args.xmp_dir or get_config().get_output_config()["xmp_export_dir"]
-        success = export_faces_to_xmp_from_json(args.json_file, xmp_dir)
+        success = export_assets_to_xmp_from_json(args.json_file, xmp_dir, args.faces_only)
         if success:
             logger.info("\n🎉 XMP files generated successfully from JSON!")
             logger.info(f"   Check the '{Path(xmp_dir).absolute()}' directory for XMP sidecar files.")
@@ -948,6 +968,8 @@ def main() -> None:
 
     logger.debug(f"JSON output directory: {json_dir}")
     logger.debug(f"XMP output directory: {xmp_dir}")
+    if args.faces_only:
+        logger.info("   Face-only mode enabled")
     if args.max_assets:
         logger.info(f"   Maximum assets to process: {args.max_assets}")
 
@@ -959,7 +981,7 @@ def main() -> None:
 
     if args.direct_xmp:
         logger.info("\n   Running direct XMP export (single stage): API -> XMP (no intermediate JSON)")
-        success = export_faces_to_xmp(session, access_token, xmp_dir, args.max_assets, args.album_id, args.library_id)
+        success = export_assets_to_xmp(session, access_token, xmp_dir, args.max_assets, args.album_id, args.library_id, args.faces_only)
         if success:
             logger.info("\n🎉 Direct XMP export completed successfully!")
             logger.info(f"   XMP files: {Path(xmp_dir).absolute()}")
@@ -967,9 +989,9 @@ def main() -> None:
             logger.error("\n❌ Direct XMP export failed")
         return
 
-    json_file_path = export_faces_to_json(session, access_token, json_dir, args.max_assets, args.album_id, args.library_id)
+    json_file_path = export_assets_to_json(session, access_token, json_dir, args.max_assets, args.album_id, args.library_id, args.faces_only)
     if not json_file_path:
-        logger.error("❌ Failed to export face data to JSON")
+        logger.error("❌ Failed to export asset data to JSON")
         return
 
     if args.stage1_only:
@@ -979,7 +1001,7 @@ def main() -> None:
         return
 
     logger.info("\n   Proceeding to Stage 2: Generate XMP files from JSON...")
-    if export_faces_to_xmp_from_json(json_file_path, xmp_dir):
+    if export_assets_to_xmp_from_json(json_file_path, xmp_dir, args.faces_only):
         logger.info("\n🎉 Both stages completed successfully!")
     else:
         logger.error("\n❌ Failed to generate XMP files from JSON")
