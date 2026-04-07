@@ -7,16 +7,16 @@ A Python tool to securely export asset metadata from your [Immich](https://immic
 
 ## 🌟 Features
 
-- **📝 XMP for Every Matched Asset**: By default, writes an XMP sidecar for every matched asset, even when no faces are present or face regions cannot be written.
-- **🔍 Face Data Extraction**: Retrieves face recognition bounding boxes and labels directly from the Immich API.
-- **🎯 Highly Compatible**: MWG-compliant XMP sidecars for digiKam, XnView MP, Adobe Lightroom, and other photo management software.
-- **🔄 Coordinate Transformation**: Automatically handles orientation EXIF data to ensure compatibility with other tools.
-- **📁 Preserves Directory Structure**: Replicates your library structure for seamless sidecar merging.
-- **🔑 Secure Authentication**: Supports both Immich API Keys (recommended) and Email/Password login.
-- **🚀 Flexible Workflow**: Choose direct XMP export (`--direct-xmp`) or a two-stage JSON-to-XMP process (default).
-- **🎛️ Legacy Face-Only Mode**: Use `--faces-only` to export only assets where at least one valid face region can be written.
-- **🗂️ Targeted Exports**: Filter exported assets by specific `album-id` or `library-id`.
-- **⚡ Efficient Processing**: Smart batch processing with support for large photo libraries.
+- **📝 Universal XMP Export**: Writes sidecars for all matched assets, even without face data.
+- **🔍 Face Extraction**: Retrieves bounding boxes and labels directly from the Immich API.
+- **🎯 Highly Compatible**: MWG-compliant XMPs for digiKam, XnView MP, Adobe Lightroom, etc.
+- **🔄 Auto-Rotation**: Adjusts coordinates based on orientation EXIF for broad compatibility.
+- **📁 Preserves Structure**: Replicates your library's folder structure for seamless merging.
+- **🔑 Secure Auth**: Supports both Immich API Keys (recommended) and Email/Password login.
+- **🚀 Flexible Workflow**: Direct export (`--direct-xmp`) or two-stage JSON-to-XMP (default).
+- **🎛️ Face-Only Mode**: (`--faces-only`) Export only assets containing valid face regions.
+- **🗂️ Targeted Exports**: Filter by specific `--album-id` or `--library-id`.
+- **⚡ Efficient**: Smart batched API requests with support for large photo libraries.
 
 ## 📑 Project Overview
 
@@ -110,68 +110,33 @@ Configuration priority is evaluated as follows:
 
 ## 💻 Usage
 
-The script is highly customizable through command-line arguments.
+The script is highly customizable through command-line arguments. Basic execution runs the default two-stage workflow (JSON export → XMP generation) for **all matched assets**.
+
+```bash
+python export_xmp.py [OPTIONS]
+```
 
 ### Processing Modes
 
-By default, the script creates XMP sidecars for **all matched assets**. Use `--faces-only` to export only assets where at least one valid face region can be written.
+| Flag | Description |
+|------|-------------|
+| *(None)* | **Default:** Two-stage workflow (Export to JSON, then generate XMP files) |
+| `--direct-xmp` | **Direct Export:** Skip JSON file, write XMP sidecars directly to disk |
+| `--stage1-only` | **Stage 1:** Export data to JSON file only (No XMP generation) |
+| `--stage2-only` | **Stage 2:** Generate XMPs from an existing JSON file (Requires `--json-file`) |
 
-**1. Default Workflow (Two-Stage)**
+### Filtering & Options
 
-Pulls data from Immich, saves it as a JSON file, and then generates XMP sidecars from that JSON.
-
-```bash
-python export_xmp.py
-```
-
-**2. Direct Export (Fastest)**
-
-Queries Immich and immediately writes XMP sidecars to disk, skipping the intermediate JSON file.
-
-```bash
-python export_xmp.py --direct-xmp
-```
-
-**3. Face-Only**
-
-Exports only assets where at least one valid face region can be written.
-
-```bash
-python export_xmp.py --faces-only
-```
-
-**4. Run Stages Independently**
-
-```bash
-# Stage 1: Export only the JSON file
-python export_xmp.py --stage1-only
-
-# Stage 2: Generate XMP files from a previously downloaded JSON file
-python export_xmp.py --stage2-only --json-file path/to/export.json
-
-# Stage 2 with legacy face-only filtering
-python export_xmp.py --stage2-only --json-file path/to/export.json --faces-only
-```
-
-### Filtering and Options
-
-```bash
-# Filter by a specific Album or Library
-python export_xmp.py --album-id "your-album-uuid"
-python export_xmp.py --library-id "your-library-uuid"
-
-# Specify custom output directories (overrides config values)
-python export_xmp.py --json-dir ./my_jsons --xmp-dir ./my_xmps
-
-# Limit processed assets (great for testing)
-python export_xmp.py --max-assets 50
-
-# Keep previous face-only behavior
-python export_xmp.py --faces-only
-
-# Enable debug logging for detailed outputs and troubleshooting
-python export_xmp.py --debug
-```
+| Flag | Example | Description |
+|------|---------|-------------|
+| `--faces-only` | `--faces-only` | Skip assets that do not contain valid face regions |
+| `--json-file` | `--json-file data.json` | Path to existing JSON file (Required for `--stage2-only`) |
+| `--json-dir` | `--json-dir ./jsons` | Set custom directory for JSON exports (overrides config values) |
+| `--xmp-dir` | `--xmp-dir ./xmps` | Set custom directory for XMP sidecars (overrides config values) |
+| `--album-id` | `--album-id "uuid"` | Process only assets from a specific album |
+| `--library-id`| `--library-id "uuid"`| Process only assets from a specific library |
+| `--max-assets`| `--max-assets 50` | Limit processed assets (Useful for testing) |
+| `--debug` | `--debug` | Enable verbose logging for troubleshooting |
 
 ## 📁 Output Structure
 
