@@ -14,13 +14,15 @@ A Python tool to securely export asset metadata from your [Immich](https://immic
 - **📁 Preserves Structure**: Replicates your library's folder structure for seamless merging.
 - **🔑 Secure Auth**: Supports both Immich API Keys (recommended) and Email/Password login.
 - **🚀 Flexible Workflow**: Direct export (`--direct-xmp`) or two-stage JSON-to-XMP (default).
-- **🎛️ Face-Only Mode**: (`--faces-only`) Export only assets containing valid face regions.
+- **🎛️ Unified Export Selector**: Use `--export` to choose all assets, assets with faces, or assets with known visible faces.
 - **🗂️ Targeted Exports**: Filter by specific `--album-id` or `--library-id`.
 - **⚡ Efficient**: Smart batched API requests with support for large photo libraries.
 
 ## 📑 Project Overview
 
 This project exports Immich asset metadata into XMP sidecar files. When face data exists and valid regions can be calculated, it is written as MWG-compatible face regions. When face data does not exist or face regions cannot be written, the script still creates an XMP sidecar for the asset by default so you can keep sidecar coverage consistent across your library.
+
+The single `--export` flag controls which assets are exported and which face records are included. All processing modes (`--direct-xmp`, `--stage1-only`, `--stage2-only`, and the default two-stage run) use the same export selection rules, so the same `--export` value produces the same asset and face-data scope.
 
 ## Prerequisites
 
@@ -110,13 +112,15 @@ Configuration priority is evaluated as follows:
 
 ## 💻 Usage
 
-The script is highly customizable through command-line arguments. Basic execution runs the default two-stage workflow (JSON export → XMP generation) for **all matched assets**.
+The script is highly customizable through command-line arguments. Basic execution runs the default two-stage workflow (JSON export → XMP generation) with `--export all-assets`, so it processes **all matched assets**.
 
 ```bash
 python export_xmp.py [OPTIONS]
 ```
 
 ### Processing Modes
+
+All processing modes respect the same `--export` option.
 
 | Flag | Description |
 |------|-------------|
@@ -129,7 +133,7 @@ python export_xmp.py [OPTIONS]
 
 | Flag | Example | Description |
 |------|---------|-------------|
-| `--faces-only` | `--faces-only` | Skip assets that do not contain valid face regions |
+| `--export` | `--export assets-with-faces` | Select which assets and face data are exported. Choices are listed below. Default: `all-assets` |
 | `--json-file` | `--json-file data.json` | Path to existing JSON file (Required for `--stage2-only`) |
 | `--json-dir` | `--json-dir ./jsons` | Set custom directory for JSON exports (overrides config values) |
 | `--xmp-dir` | `--xmp-dir ./xmps` | Set custom directory for XMP sidecars (overrides config values) |
@@ -137,6 +141,39 @@ python export_xmp.py [OPTIONS]
 | `--library-id`| `--library-id "uuid"`| Process only assets from a specific library |
 | `--max-assets`| `--max-assets 50` | Limit processed assets (Useful for testing) |
 | `--debug` | `--debug` | Enable verbose logging for troubleshooting |
+
+### Export Selection
+
+`--export` is the only flag that controls asset and face-data selection. It has three values:
+
+| Value | What gets exported | Face data included |
+|-------|--------------------|--------------------|
+| `all-assets` | Every matched asset, including assets without faces | Complete face metadata when present |
+| `assets-with-faces` | Only matched assets that contain valid face areas | Complete face metadata for those assets |
+| `assets-with-known-visible-faces` | Only matched assets with at least one known, non-hidden face | Only known, non-hidden face records |
+
+For `assets-with-known-visible-faces`, “known” means the person has a non-empty name other than `Unknown`; hidden people or hidden/non-visible face records are excluded. The rest of the asset metadata is still preserved for every exported asset.
+
+When using `--stage2-only`, the JSON file must contain the assets and face records needed for the selected export value. A JSON file created with a narrower `--export` value cannot restore assets or face records that were not written to that JSON file.
+
+Examples:
+
+```bash
+# Default: export every matched asset with complete metadata
+python export_xmp.py --export all-assets
+
+# Export only assets that contain face regions
+python export_xmp.py --export assets-with-faces
+
+# Export only assets with known visible faces, and include only those face records
+python export_xmp.py --export assets-with-known-visible-faces
+
+# The same export selector works in direct mode
+python export_xmp.py --direct-xmp --export assets-with-known-visible-faces
+
+# The same export selector also works in Stage 2 from JSON
+python export_xmp.py --stage2-only --json-file path/to/export.json --export assets-with-known-visible-faces
+```
 
 ## 📁 Output Structure
 
@@ -146,7 +183,7 @@ The tool securely generates files in the configured output directories without m
 
 ```text
 json_exports/
-├── immich_assets_export_20260313_143022.json  # Complete export payload for matched assets
+├── immich_assets_export_20260313_143022.json  # Complete export payload for selected assets
 ```
 
 ### XMP Sidecars (Stage 2 or Direct Mode)
@@ -221,13 +258,13 @@ print('Environment config test OK')
 **A:** Double-check your server URL (ensure it does not end with `/api`). If using an API key, verify it has `asset.read` permissions.
 
 **Q: No XMP files were generated?**
-**A:** By default, the script writes one XMP file for every matched asset. If no files were generated, check your filters, output permissions, and whether any assets were returned by Immich. If you are using `--faces-only`, only assets where a valid face region can be written will generate an XMP file.
+**A:** By default, the script writes one XMP file for every matched asset. If no files were generated, check your filters, output permissions, and whether any assets were returned by Immich. If you are using `--export assets-with-faces`, only assets with valid face areas are exported. If you are using `--export assets-with-known-visible-faces`, only assets with at least one known, non-hidden face are exported.
 
 **Q: Output directory permission error or "Refusing to write outside output directory"?**
 **A:** The script includes path-traversal protection to prevent overwriting critical system files. It will explicitly refuse to write `.xmp` files outside the designated output directory. Ensure you have proper write permissions for the output folder.
 
 **Q: Empty XMP files or missing face regions?**
-**A:** Ensure your photos have been fully processed for face recognition in Immich. Assets without faces still produce metadata sidecars by default, and assets with people but no exportable face regions still keep the rest of their metadata and keywords. Use `--faces-only` to skip those cases and keep the legacy face-region-only behavior.
+**A:** Ensure your photos have been fully processed for face recognition in Immich. With the default `--export all-assets`, assets without faces still produce metadata sidecars, and assets with people but no exportable face regions still keep the rest of their metadata and keywords. Use `--export assets-with-faces` to export only assets that contain valid face areas. Use `--export assets-with-known-visible-faces` to export only assets with known, non-hidden faces and to omit unknown or hidden face records.
 
 **Q: How does the tool handle large libraries?**
 **A:** The script automatically paginates processing (200 assets at a time) and handles network retries automatically. Processing progress is logged to the console in real time.
@@ -243,8 +280,9 @@ print('Environment config test OK')
 
 ## 🔄 Recent Changes
 
-- **Default export now writes XMP for all matched assets**, even when no faces are present.
-- **Added `--faces-only`** to preserve the previous face-only export behavior, including skipping assets when a face region cannot be written.
+- **Added unified `--export` selection** with `all-assets`, `assets-with-faces`, and `assets-with-known-visible-faces`.
+- **Removed the old face-only CLI option** in favor of the single `--export` flag.
+- **Default export remains `all-assets`**, writing XMP for all matched assets even when no faces are present.
 - Renamed the main script to `export_xmp.py` and aligned export naming with asset-wide behavior.
 - Added direct export mode with `--direct-xmp`.
 - Added API key authentication support.
