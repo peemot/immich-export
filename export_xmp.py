@@ -352,6 +352,31 @@ def normalize_people(raw_people: Any) -> List[Dict[str, Any]]:
     return people
 
 
+def filter_asset_for_export(asset_data: Dict[str, Any], export: str) -> Optional[Dict[str, Any]]:
+    """Return a copy of asset_data filtered for the selected export mode, or None to skip it."""
+    people = normalize_people(asset_data.get("people"))
+
+    if export == "assets-with-known-visible-faces":
+        visible_people: List[Dict[str, Any]] = []
+        for person in people:
+            person_name = (person.get("name") or "").strip()
+            if not person_name or person_name.lower() == "unknown" or person.get("isHidden"):
+                continue
+            faces = [
+                face
+                for face in (person.get("faces") or [])
+                if not face.get("isHidden") and face.get("isVisible", True) is not False
+            ]
+            if faces:
+                visible_people.append({**person, "faces": faces})
+        people = visible_people
+
+    if export != "all-assets" and not people:
+        return None
+
+    return {**asset_data, "people": people}
+
+
 def _extract_search_page_items(search_data: Any, page: int) -> Tuple[List[Dict[str, Any]], Optional[Any]]:
     """Unify the slightly defensive search-response parsing in one small helper."""
     assets_data = search_data.get("assets") if isinstance(search_data, dict) else None
@@ -584,14 +609,19 @@ def process_assets(
     max_assets: Optional[int] = None,
     album_id: Optional[str] = None,
     library_id: Optional[str] = None,
-    faces_only: bool = False,
+    export: str = "all-assets",
 ) -> Iterator[Dict[str, Any]]:
-    """Yield assets, optionally limited to those that contain at least one valid face region."""
+    """Yield assets filtered according to the selected export mode."""
     page = 1
     progress_interval = 100
     yielded_assets = 0
+    export_label = {
+        "all-assets": "assets",
+        "assets-with-faces": "assets with faces",
+        "assets-with-known-visible-faces": "assets with known visible faces",
+    }.get(export, "assets")
 
-    logger.info("   Collecting assets with faces..." if faces_only else "   Collecting assets...")
+    logger.info(f"   Collecting {export_label}...")
 
     while True:
         if max_assets is not None and yielded_assets >= max_assets:
@@ -601,7 +631,7 @@ def process_assets(
         try:
             search_payload = {
                 "page": page,
-                "size": 200,  # Fetch 200 fully-populated assets at once.
+                "size": 500,  # Fetch 500 fully-populated assets at once.
                 "withPeople": True,  # Ask Immich to INCLUDE people/faces in each returned asset.
                 "withExif": True,  # Embed the EXIF data directly in this list response.
             }
@@ -628,13 +658,25 @@ def process_assets(
                 if max_assets is not None and yielded_assets >= max_assets:
                     break
 
-                normalized_people = normalize_people(item.get("people"))
-                if faces_only and not normalized_people:
+                file_name = item.get("originalFileName", "Unknown")
+                asset_info = filter_asset_for_export(
+                    {
+                        "asset_id": item.get("id", ""),
+                        "original_path": item.get("originalPath", ""),
+                        "file_name": file_name,
+                        "width": item.get("width"),
+                        "height": item.get("height"),
+                        "exifInfo": item.get("exifInfo") or {},
+                        "people": item.get("people") or [],
+                    },
+                    export,
+                )
+                if asset_info is None:
                     continue
 
                 yielded_assets += 1
+                normalized_people = asset_info.get("people") or []
                 total_faces = sum(len(person.get("faces") or []) for person in normalized_people)
-                file_name = item.get("originalFileName", "Unknown")
 
                 if logger.isEnabledFor(logging.DEBUG):
                     logger.debug(
@@ -642,17 +684,9 @@ def process_assets(
                         f"{len(normalized_people)} people, {total_faces} faces"
                     )
                 elif progress_interval and yielded_assets % progress_interval == 0:
-                    logger.info(f"   Progress: Found {yielded_assets} {'assets with faces' if faces_only else 'assets'}...")
+                    logger.info(f"   Progress: Found {yielded_assets} {export_label}...")
 
-                yield {
-                    "asset_id": item.get("id", ""),
-                    "original_path": item.get("originalPath", ""),
-                    "file_name": file_name,
-                    "width": item.get("width"),
-                    "height": item.get("height"),
-                    "exifInfo": item.get("exifInfo") or {},
-                    "people": normalized_people,
-                }
+                yield asset_info
 
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(f"Finished processing page {page}")
@@ -668,7 +702,7 @@ def process_assets(
             logger.error(f"❌ Error collecting assets on page {page}: {e}")
             break
 
-    logger.info(f"✅ Processing completed: Found {yielded_assets} {'assets with faces' if faces_only else 'assets'}")
+    logger.info(f"✅ Processing completed: Found {yielded_assets} {export_label}")
 
 
 def export_assets_to_json(
@@ -678,7 +712,7 @@ def export_assets_to_json(
     max_assets: Optional[int] = None,
     album_id: Optional[str] = None,
     library_id: Optional[str] = None,
-    faces_only: bool = False,
+    export: str = "all-assets",
 ) -> Optional[str]:
     """Export asset data to JSON file (Stage 1) without holding the full library in memory."""
     logger.info("\n   Starting export to JSON format (Stage 1)...")
@@ -695,7 +729,7 @@ def export_assets_to_json(
     try:
         with open(assets_tmp_path, "w", encoding="utf-8") as assets_file:
             first_asset = True
-            for asset_info in process_assets(session, access_token, max_assets, album_id, library_id, faces_only):
+            for asset_info in process_assets(session, access_token, max_assets, album_id, library_id, export):
                 if not first_asset:
                     assets_file.write(",\n")
                 json.dump(asset_info, assets_file, ensure_ascii=False, separators=(",", ":"))
@@ -744,7 +778,7 @@ def write_xmp_for_assets(
     json_source: Optional[str] = None,
     progress_every: int = 500,
     top_people_to_print: int = 10,
-    faces_only: bool = False,
+    export: str = "all-assets",
 ) -> bool:
     """
     Take processed assets and write XMP sidecars + a summary file.
@@ -760,6 +794,7 @@ def write_xmp_for_assets(
     total_faces_processed = 0
     processed_count = 0
     person_stats: Dict[str, int] = {}
+    require_face_regions = export != "all-assets"
 
     count_label = f"for {total_assets} assets" if total_assets else "for streamed assets"
     logger.info(f"\n   Creating XMP files {count_label}...")
@@ -769,7 +804,7 @@ def write_xmp_for_assets(
         people_data = asset_data.get("people") or []
         file_label = asset_data.get("file_name") or asset_data.get("originalFileName") or "Unknown"
 
-        xmp_content = create_xmp_content(asset_data, faces_only)
+        xmp_content = create_xmp_content(asset_data, require_face_regions)
         if not xmp_content.strip():
             logger.warning(f"   Warning: Empty XMP content for asset {file_label}")
         else:
@@ -837,7 +872,7 @@ def write_xmp_for_assets(
 def export_assets_to_xmp_from_json(
     json_file_path: str,
     output_dir: str = "xmp_sidecars",
-    faces_only: bool = False,
+    export: str = "all-assets",
 ) -> bool:
     """Export asset data to XMP format from JSON file (Stage 2)."""
     logger.info("   Starting export to XMP format from JSON file (Stage 2)...")
@@ -850,9 +885,11 @@ def export_assets_to_xmp_from_json(
         logger.error(f"❌ Error loading JSON file: {e}")
         return False
 
-    processed_assets = export_data.get("assets") or []
-    if faces_only:
-        processed_assets = [asset for asset in processed_assets if normalize_people(asset.get("people"))]
+    processed_assets: List[Dict[str, Any]] = []
+    for asset in export_data.get("assets") or []:
+        filtered_asset = filter_asset_for_export(asset, export)
+        if filtered_asset is not None:
+            processed_assets.append(filtered_asset)
     if not processed_assets:
         logger.warning("No matching assets found in JSON file")
         return False
@@ -863,7 +900,7 @@ def export_assets_to_xmp_from_json(
         output_dir,
         total_assets=len(processed_assets),
         json_source=json_file_path,
-        faces_only=faces_only,
+        export=export,
     )
 
 
@@ -874,14 +911,14 @@ def export_assets_to_xmp(
     max_assets: Optional[int] = None,
     album_id: Optional[str] = None,
     library_id: Optional[str] = None,
-    faces_only: bool = False,
+    export: str = "all-assets",
 ) -> bool:
     """Direct one-stage export: stream Immich API results straight to XMP sidecars."""
     logger.info("   Starting DIRECT export to XMP format (API -> XMP, no JSON)...")
     return write_xmp_for_assets(
-        process_assets(session, access_token, max_assets, album_id, library_id, faces_only),
+        process_assets(session, access_token, max_assets, album_id, library_id, export),
         output_dir,
-        faces_only=faces_only,
+        export=export,
     )
 
 
@@ -898,8 +935,11 @@ Examples:
   # Run direct one-stage export (no JSON file written)
   python export_xmp.py --direct-xmp
 
-  # Export only assets with faces (legacy behavior)
-  python export_xmp.py --faces-only
+  # Export only assets with any valid face area
+  python export_xmp.py --export assets-with-faces
+
+  # Export only assets with known, non-hidden faces; write only those face regions
+  python export_xmp.py --export assets-with-known-visible-faces
 
   # Run only Stage 1: Export to JSON file
   python export_xmp.py --stage1-only
@@ -921,7 +961,12 @@ Examples:
     mode.add_argument("--stage2-only", action="store_true", help="Run only Stage 2: Generate XMP files from existing JSON file")
     mode.add_argument("--direct-xmp", action="store_true", help="Run direct export: query Immich and write XMP sidecars directly")
 
-    parser.add_argument("--faces-only", action="store_true", help="Export only assets that contain at least one valid face region")
+    parser.add_argument(
+        "--export",
+        choices=["all-assets", "assets-with-faces", "assets-with-known-visible-faces"],
+        default="all-assets",
+        help="Select which assets and face data to export (default: all-assets)",
+    )
     parser.add_argument("--json-file", type=str, help="Path to JSON file for Stage 2 (required with --stage2-only)")
     parser.add_argument("--json-dir", type=str, default=None, help="Directory for JSON exports (default: from config)")
     parser.add_argument("--xmp-dir", type=str, default=None, help="Directory for XMP output (default: from config)")
@@ -945,8 +990,9 @@ def main() -> None:
 
     if args.stage2_only:
         logger.info("Running Stage 2 only: Generate XMP from JSON file")
+        logger.info(f"   Export mode: {args.export}")
         xmp_dir = args.xmp_dir or get_config().get_output_config()["xmp_export_dir"]
-        success = export_assets_to_xmp_from_json(args.json_file, xmp_dir, args.faces_only)
+        success = export_assets_to_xmp_from_json(args.json_file, xmp_dir, args.export)
         if success:
             logger.info("\n🎉 XMP files generated successfully from JSON!")
             logger.info(f"   Check the '{Path(xmp_dir).absolute()}' directory for XMP sidecar files.")
@@ -968,8 +1014,7 @@ def main() -> None:
 
     logger.debug(f"JSON output directory: {json_dir}")
     logger.debug(f"XMP output directory: {xmp_dir}")
-    if args.faces_only:
-        logger.info("   Face-only mode enabled")
+    logger.info(f"   Export mode: {args.export}")
     if args.max_assets:
         logger.info(f"   Maximum assets to process: {args.max_assets}")
 
@@ -981,7 +1026,7 @@ def main() -> None:
 
     if args.direct_xmp:
         logger.info("\n   Running direct XMP export (single stage): API -> XMP (no intermediate JSON)")
-        success = export_assets_to_xmp(session, access_token, xmp_dir, args.max_assets, args.album_id, args.library_id, args.faces_only)
+        success = export_assets_to_xmp(session, access_token, xmp_dir, args.max_assets, args.album_id, args.library_id, args.export)
         if success:
             logger.info("\n🎉 Direct XMP export completed successfully!")
             logger.info(f"   XMP files: {Path(xmp_dir).absolute()}")
@@ -989,7 +1034,7 @@ def main() -> None:
             logger.error("\n❌ Direct XMP export failed")
         return
 
-    json_file_path = export_assets_to_json(session, access_token, json_dir, args.max_assets, args.album_id, args.library_id, args.faces_only)
+    json_file_path = export_assets_to_json(session, access_token, json_dir, args.max_assets, args.album_id, args.library_id, args.export)
     if not json_file_path:
         logger.error("❌ Failed to export asset data to JSON")
         return
@@ -1001,7 +1046,7 @@ def main() -> None:
         return
 
     logger.info("\n   Proceeding to Stage 2: Generate XMP files from JSON...")
-    if export_assets_to_xmp_from_json(json_file_path, xmp_dir, args.faces_only):
+    if export_assets_to_xmp_from_json(json_file_path, xmp_dir, args.export):
         logger.info("\n🎉 Both stages completed successfully!")
     else:
         logger.error("\n❌ Failed to generate XMP files from JSON")
