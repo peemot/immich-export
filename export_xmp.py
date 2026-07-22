@@ -9,8 +9,10 @@ import argparse
 import json
 import logging
 import os
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
+from queue import Queue
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 from xml.sax.saxutils import escape as _xml_escape
 
@@ -94,6 +96,7 @@ class ConfigLoader:
             "IMMICH_PASSWORD": ["immich", "password"],
             "IMMICH_REQUEST_TIMEOUT": ["settings", "request_timeout"],
             "IMMICH_RETRY_ATTEMPTS": ["settings", "retry_attempts"],
+            "IMMICH_FACE_REQUEST_WORKERS": ["settings", "face_request_workers"],
             "OUTPUT_XMP_DIR": ["output", "xmp_export_dir"],
             "OUTPUT_JSON_DIR": ["output", "json_export_dir"],
         }
@@ -111,7 +114,7 @@ class ConfigLoader:
             current = current.setdefault(key, {})
 
         # Convert numeric values
-        if path[-1] in ["request_timeout", "retry_attempts"]:
+        if path[-1] in ["request_timeout", "retry_attempts", "face_request_workers"]:
             try:
                 current[path[-1]] = int(value)
             except ValueError:
@@ -152,9 +155,15 @@ class ConfigLoader:
 
     def get_settings_config(self) -> Dict[str, Any]:
         """Get general settings configuration."""
+        face_request_workers = self.get("settings.face_request_workers", 8)
+        try:
+            face_request_workers = max(1, min(16, int(face_request_workers)))
+        except (TypeError, ValueError):
+            face_request_workers = 8
         return {
             "request_timeout": self.get("settings.request_timeout", 30),
             "retry_attempts": self.get("settings.retry_attempts", 3),
+            "face_request_workers": face_request_workers,
         }
 
     def validate_immich_config(self) -> bool:
@@ -173,7 +182,7 @@ class ConfigLoader:
             logger.error("❌ Configuration error: API key OR Email and password are required")
             logger.error("   Please set them in config.json or use environment variables:")
             logger.error("   IMMICH_API_KEY or (IMMICH_EMAIL and IMMICH_PASSWORD)")
-            logger.error("   Note: If using an API key, it must have at least 'asset.read' permission.")
+            logger.error("   Note: If using an API key, it must have at least 'asset.read' and 'face.read' permissions.")
             return False
 
         return True
@@ -185,6 +194,7 @@ class ConfigLoader:
         logger.info("   Auth Method: API Key" if self.get("immich.api_key") else f"   Auth Method: Email ({self.get('immich.email')})")
         logger.info(f"   Timeout: {self.get('settings.request_timeout')}s")
         logger.info(f"   Retry Attempts: {self.get('settings.retry_attempts')}")
+        logger.info(f"   Face Request Workers: {self.get_settings_config()['face_request_workers']}")
         logger.info(f"   JSON output directory: {self.get('output.json_export_dir')}")
         logger.info(f"   XMP output directory: {self.get('output.xmp_export_dir')}")
 
@@ -390,6 +400,72 @@ def _extract_search_page_items(search_data: Any, page: int) -> Tuple[List[Dict[s
         raise ValueError(f"❌ Error: Unexpected 'items' type on page {page} (expected list)")
 
     return items, assets_data.get("nextPage")
+
+
+def get_asset_people(
+    session: requests.Session,
+    asset_id: str,
+    access_token: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Retrieve face data for an asset and group it by person."""
+    if not asset_id:
+        return []
+
+    faces = api_request(
+        session,
+        "GET",
+        "/faces",
+        token=access_token,
+        params={"id": asset_id},
+    ).json()
+    if not isinstance(faces, list):
+        raise ValueError(f"❌ Error: Unexpected faces response shape for asset {asset_id} (expected list)")
+
+    people_by_id: Dict[str, Dict[str, Any]] = {}
+    for face in faces:
+        if not isinstance(face, dict):
+            continue
+
+        person = face.get("person")
+        face_data = {key: value for key, value in face.items() if key != "person"}
+        if isinstance(person, dict) and person.get("id"):
+            person_data = people_by_id.setdefault(str(person["id"]), {**person, "faces": []})
+        else:
+            person_data = people_by_id.setdefault("__unknown__", {"name": "Unknown", "faces": []})
+        person_data["faces"].append(face_data)
+
+    return list(people_by_id.values())
+
+
+def get_page_asset_people(
+    items: List[Dict[str, Any]],
+    access_token: Optional[str],
+) -> List[Future]:
+    """Retrieve face data concurrently for one metadata page."""
+    if not items:
+        return []
+
+    settings_config = get_config().get_settings_config()
+    worker_count = min(settings_config["face_request_workers"], len(items))
+    worker_sessions: Queue[requests.Session] = Queue()
+    for _ in range(worker_count):
+        worker_sessions.put(create_http_session(settings_config["retry_attempts"]))
+
+    def fetch_people(item: Dict[str, Any]) -> List[Dict[str, Any]]:
+        worker_session = worker_sessions.get()
+        try:
+            return get_asset_people(worker_session, item.get("id", ""), access_token)
+        finally:
+            worker_sessions.put(worker_session)
+
+    try:
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = [executor.submit(fetch_people, item) for item in items]
+    finally:
+        while not worker_sessions.empty():
+            worker_sessions.get().close()
+
+    return futures
 
 
 def create_xmp_content(asset_data: Dict[str, Any], require_face_regions: bool = False) -> str:
@@ -631,10 +707,11 @@ def process_assets(
         try:
             search_payload = {
                 "page": page,
-                "size": 500,  # Fetch 500 fully-populated assets at once.
-                "withPeople": True,  # Ask Immich to INCLUDE people/faces in each returned asset.
+                "size": 1000,  # Fetch 1000 fully-populated assets at once.
                 "withExif": True,  # Embed the EXIF data directly in this list response.
             }
+            if export == "assets-with-known-visible-faces":
+                search_payload["withPeople"] = True
             if album_id:
                 search_payload["albumIds"] = [album_id]
             if library_id:
@@ -654,7 +731,21 @@ def process_assets(
             if not items:
                 break
 
-            for item in items:
+            if export == "assets-with-known-visible-faces":
+                items = [
+                    item
+                    for item in items
+                    if any(
+                        (person.get("name") or "").strip().lower() not in ("", "unknown")
+                        and not person.get("isHidden")
+                        for person in item.get("people") or []
+                        if isinstance(person, dict)
+                    )
+                ]
+
+            people_futures = get_page_asset_people(items, access_token)
+
+            for item, people_future in zip(items, people_futures):
                 if max_assets is not None and yielded_assets >= max_assets:
                     break
 
@@ -667,7 +758,7 @@ def process_assets(
                         "width": item.get("width"),
                         "height": item.get("height"),
                         "exifInfo": item.get("exifInfo") or {},
-                        "people": item.get("people") or [],
+                        "people": people_future.result(),
                     },
                     export,
                 )
