@@ -21,7 +21,7 @@ By default, it creates a sidecar for every matched asset. You can limit the expo
 
 1. Python 3.10+
 2. Immich v1.100.0 or newer
-3. An Immich API key with at least `asset.read` permission, or an Immich email/password login
+3. An Immich API key with at least `asset.read` and `face.read` permissions, or an Immich email/password login
 
 ## Quick start
 
@@ -58,7 +58,8 @@ Example `config.json`:
   },
   "settings": {
     "request_timeout": 30,
-    "retry_attempts": 3
+    "retry_attempts": 3,
+    "face_request_workers": 8
   },
   "output": {
     "xmp_export_dir": "xmp_sidecars",
@@ -100,11 +101,12 @@ Configuration is applied in this order:
 | JSON path | Environment variable | Default | Description |
 |-----------|----------------------|---------|-------------|
 | `immich.base_url` | `IMMICH_BASE_URL` | - | Immich server URL |
-| `immich.api_key` | `IMMICH_API_KEY` | - | API key; requires `asset.read` permission |
+| `immich.api_key` | `IMMICH_API_KEY` | - | API key; requires `asset.read` and `face.read` permissions |
 | `immich.email` | `IMMICH_EMAIL` | - | Login email, used only if no API key is set |
 | `immich.password` | `IMMICH_PASSWORD` | - | Login password, used only if no API key is set |
 | `settings.request_timeout` | `IMMICH_REQUEST_TIMEOUT` | `30` | Network request timeout in seconds |
 | `settings.retry_attempts` | `IMMICH_RETRY_ATTEMPTS` | `3` | Retries for 429 and 5xx responses |
+| `settings.face_request_workers` | `IMMICH_FACE_REQUEST_WORKERS` | `8` | Concurrent `/api/faces` requests; clamped to 1-16 |
 | `output.xmp_export_dir` | `OUTPUT_XMP_DIR` | `xmp_sidecars` | Directory for generated `.xmp` files |
 | `output.json_export_dir` | `OUTPUT_JSON_DIR` | `json_exports` | Directory for intermediate JSON exports |
 
@@ -206,13 +208,13 @@ To apply the sidecars, inspect the generated tree and copy or merge it into your
 - `config.json` can contain an API key, email, or password. Do not commit it to version control.
 - Generated JSON and XMP files may contain names, face regions, GPS/location fields, camera metadata, timestamps, and original asset paths.
 - The script strips unsafe path components and refuses to write XMP files outside the configured output directory.
-- API requests are paginated at 500 assets per request and retried on 429 and 5xx responses.
+- Asset search requests are paginated at 1000 assets per request. Face data is retrieved concurrently within each metadata page, using up to `settings.face_request_workers` `/api/faces` requests at a time. Requests are retried on 429 and 5xx responses.
 
 ## Troubleshooting
 
 | Problem | What to check |
 |---------|---------------|
-| Authentication failed | Check that `immich.base_url` does not end with `/api`. If using an API key, verify it has `asset.read` permission. |
+| Authentication failed | Check that `immich.base_url` does not end with `/api`. If using an API key, verify it has `asset.read` and `face.read` permissions. |
 | No XMP files were generated | Check filters, output permissions, and whether Immich returned any assets. Some `--export` modes intentionally skip assets. |
 | Missing face regions | Make sure face recognition has finished in Immich. Check whether the selected `--export` mode excludes unknown, hidden, or non-visible faces. |
 | Sidecars exist but contain no face regions | This can be expected. The default mode still creates sidecars for assets without writable face regions. |
