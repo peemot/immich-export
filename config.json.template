@@ -7,7 +7,8 @@
   },
   "settings": {
     "request_timeout": 30,
-    "retry_attempts": 3
+    "retry_attempts": 3,
+    "face_request_workers": 8
   },
   "output": {
     "xmp_export_dir": "xmp_sidecars",
