@@ -185,6 +185,8 @@ json_exports/
 └── immich_assets_export_20260313_143022.json
 ```
 
+The intermediate file has `export_timestamp`, `immich_server`, `total_assets`, and an `assets` array. Each asset contains its ID, original path, file name, dimensions, `exifInfo`, and `people`. Each person's `faces` contain bounding boxes and, when available, the dimensions of the face-analysis image. For rotated photos, those dimensions can differ from the raw EXIF image dimensions. Stage 2 reads this file locally; it does not need an Immich connection or credentials when `--xmp-dir` is provided.
+
 ### XMP sidecars, Stage 2 or direct mode
 
 The `xmp_sidecars` directory mirrors the original Immich asset paths.
@@ -223,6 +225,24 @@ To apply the sidecars, inspect the generated tree and copy or merge it into your
 | Large library behavior | Use `--max-assets`, `--album-id`, or `--library-id` for smaller test runs. |
 | Config file not found | Copy `config.json.template` to `config.json`, or configure the tool with environment variables. |
 | Script is silent or seems stuck | Run with `--debug` for verbose logging. |
+
+## Tests
+
+Install the runtime dependency and run the standard-library test suite from the repository root:
+
+```bash
+python -m pip install requests
+python -m unittest discover -s tests -v
+```
+
+The suite stays in two files and needs no additional test framework:
+
+| File | Regression coverage |
+|------|---------------------|
+| `tests/test_export_xmp.py` | Export selection, API-to-JSON field preservation, staged/direct output equivalence, all eight EXIF orientations, dimension fallbacks, camera/date/GPS metadata, XML escaping, keywords, summaries, write failures, and safe sidecar paths |
+| `tests/test_api_cli.py` | Config/environment precedence, credential validation, auth headers, HTTP error handling, retry policy, concurrent face ordering and session cleanup, CLI validation and mode routing |
+
+Tests parse generated XML and inspect actual temporary files. The suite blocks real HTTP requests and checks for attempted requests even if the exporter catches the resulting exception. Worker tests use real threads with bounded session-pool waits. No server, credentials, or personal export data are needed. The symlink test is skipped on systems where directory symlinks are unavailable.
 
 ## Contributing
 
