@@ -468,8 +468,12 @@ def get_page_asset_people(
     return futures
 
 
-def create_xmp_content(asset_data: Dict[str, Any], require_face_regions: bool = False) -> str:
-    """Create XMP content for asset metadata and optional face recognition data."""
+def create_xmp_content(
+    asset_data: Dict[str, Any],
+    require_face_regions: bool = False,
+    region_counts: Optional[Dict[str, int]] = None,
+) -> str:
+    """Create XMP content, optionally recording the face regions actually written."""
     people = normalize_people(asset_data.get("people"))
     exif_info = asset_data.get("exifInfo") or {}
     now = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
@@ -617,6 +621,8 @@ def create_xmp_content(asset_data: Dict[str, Any], require_face_regions: bool = 
                     ]
                 )
                 regions_written += 1
+                if region_counts is not None:
+                    region_counts[person_name] = region_counts.get(person_name, 0) + 1
 
         if require_face_regions and regions_written == 0:
             return ""
@@ -791,7 +797,7 @@ def process_assets(
                 page += 1
         except Exception as e:
             logger.error(f"❌ Error collecting assets on page {page}: {e}")
-            break
+            raise
 
     logger.info(f"✅ Processing completed: Found {yielded_assets} {export_label}")
 
@@ -815,6 +821,7 @@ def export_assets_to_json(
     json_filename = f"immich_assets_export_{timestamp}.json"
     json_file_path = output_path / json_filename
     assets_tmp_path = output_path / f".{json_filename}.assets.tmp"
+    json_tmp_path = output_path / f".{json_filename}.json.tmp"
 
     total_assets = 0
     try:
@@ -831,7 +838,7 @@ def export_assets_to_json(
             logger.warning("No matching assets found")
             return None
 
-        with open(json_file_path, "w", encoding="utf-8") as out_file, open(assets_tmp_path, "r", encoding="utf-8") as assets_file:
+        with open(json_tmp_path, "w", encoding="utf-8") as out_file, open(assets_tmp_path, "r", encoding="utf-8") as assets_file:
             out_file.write("{\n")
             out_file.write(f'  "export_timestamp": {json.dumps(datetime.now().isoformat(), ensure_ascii=False)},\n')
             out_file.write(f'  "immich_server": {json.dumps(get_config().get_immich_config()["base_url"].rstrip("/"), ensure_ascii=False)},\n')
@@ -844,21 +851,24 @@ def export_assets_to_json(
                 out_file.write(chunk)
             out_file.write("\n  ]\n}\n")
 
+        json_tmp_path.replace(json_file_path)
+
         json_file_path_abs = json_file_path.absolute()
         logger.info("✅ JSON export completed!")
         logger.info("\n📊 Statistics:")
         logger.info(f"   Total assets exported: {total_assets}")
         logger.info(f"   JSON file: {json_file_path_abs}")
         return str(json_file_path_abs)
-    except IOError as e:
-        logger.error(f"❌ Error saving JSON file: {e}")
+    except Exception as e:
+        logger.error(f"❌ Error exporting JSON file: {e}")
         return None
     finally:
-        try:
-            if assets_tmp_path.exists():
-                assets_tmp_path.unlink()
-        except OSError:
-            pass
+        for tmp_path in (assets_tmp_path, json_tmp_path):
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except OSError:
+                pass
 
 
 def write_xmp_for_assets(
@@ -891,30 +901,29 @@ def write_xmp_for_assets(
     logger.info(f"\n   Creating XMP files {count_label}...")
     logger.info(f"   Output directory: {output_path.absolute()}")
 
-    for processed_count, asset_data in enumerate(assets, 1):
-        people_data = asset_data.get("people") or []
-        file_label = asset_data.get("file_name") or asset_data.get("originalFileName") or "Unknown"
+    try:
+        for processed_count, asset_data in enumerate(assets, 1):
+            file_label = asset_data.get("file_name") or asset_data.get("originalFileName") or "Unknown"
+            region_counts: Dict[str, int] = {}
+            xmp_content = create_xmp_content(asset_data, require_face_regions, region_counts)
+            if not xmp_content.strip():
+                logger.warning(f"   Warning: Empty XMP content for asset {file_label}")
+            else:
+                asset_id = asset_data.get("asset_id") or asset_data.get("id") or f"idx_{processed_count}"
+                original_path = asset_data.get("original_path") or asset_data.get("originalPath") or f"unknown_{asset_id}.jpg"
 
-        xmp_content = create_xmp_content(asset_data, require_face_regions)
-        if not xmp_content.strip():
-            logger.warning(f"   Warning: Empty XMP content for asset {file_label}")
-        else:
-            asset_id = asset_data.get("asset_id") or asset_data.get("id") or f"idx_{processed_count}"
-            original_path = asset_data.get("original_path") or asset_data.get("originalPath") or f"unknown_{asset_id}.jpg"
+                if save_xmp_sidecar(original_path, xmp_content, str(output_path)):
+                    total_files_created += 1
+                    total_faces_processed += sum(region_counts.values())
+                    for person_name, face_count in region_counts.items():
+                        person_stats[person_name] = person_stats.get(person_name, 0) + face_count
 
-            if save_xmp_sidecar(original_path, xmp_content, str(output_path)):
-                total_files_created += 1
-                for person in people_data:
-                    face_count = len(person.get("faces") or [])
-                    if face_count <= 0:
-                        continue
-                    person_name = (person.get("name") or "Unknown").strip() or "Unknown"
-                    total_faces_processed += face_count
-                    person_stats[person_name] = person_stats.get(person_name, 0) + face_count
-
-        if progress_every and processed_count % progress_every == 0:
-            suffix = f"/{total_assets}" if total_assets else ""
-            logger.info(f"   Progress: {processed_count}{suffix} assets processed")
+            if progress_every and processed_count % progress_every == 0:
+                suffix = f"/{total_assets}" if total_assets else ""
+                logger.info(f"   Progress: {processed_count}{suffix} assets processed")
+    except Exception as e:
+        logger.error(f"❌ XMP export stopped after asset {processed_count}: {e}")
+        return False
 
     if processed_count == 0:
         logger.warning("No assets found")
