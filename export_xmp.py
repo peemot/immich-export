@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""
-XMP export script for Immich.
-Uses search API to get face data.
-Exports asset metadata to XMP format, supported by digiKam, XnView MP and others.
+"""Export Immich metadata and face regions to JSON and XMP, in one file.
+
+Configuration is loaded at the CLI boundary. ImmichClient owns HTTP and the
+search protocol; export records are ordinary dictionaries shared by the
+API and offline JSON paths. Selection and XMP rendering do not perform I/O.
+The writers preserve the original formats, ordering and partial-failure policy.
 """
 
 import argparse
@@ -10,17 +12,17 @@ import json
 import logging
 import os
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from queue import Queue
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Generator, Iterable, Iterator, List, Mapping, Optional, Tuple, TypedDict
 from xml.sax.saxutils import escape as _xml_escape
 
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# --- Logging Setup ---
 logger = logging.getLogger(__name__)
 
 FACE_BOX_KEYS = (
@@ -29,14 +31,76 @@ FACE_BOX_KEYS = (
     "boundingBoxX2",
     "boundingBoxY2",
 )
-
 DEFAULT_HEADERS = {
     "Content-Type": "application/json",
     "Accept": "application/json",
 }
 
-# Lazy global config loader
-_CONFIG_INSTANCE: Optional["ConfigLoader"] = None
+
+# --- Data passed between the application boundaries ---
+
+
+class ExportAsset(TypedDict):
+    """The API projection, not a schema validator for existing JSON files.
+
+    Nested EXIF, person and face dictionaries retain their additional fields.
+    Offline records may also contain aliases and extra top-level fields;
+    filtering and rendering must not rebuild those records from this annotation.
+    """
+
+    asset_id: str
+    original_path: str
+    file_name: str
+    width: Any
+    height: Any
+    exifInfo: Dict[str, Any]
+    people: List[Dict[str, Any]]
+
+
+@dataclass(frozen=True)
+class ApiSettings:
+    """Connection values resolved once, before any HTTP work begins."""
+
+    base_url: str
+    api_key: str = field(default="", repr=False)
+    request_timeout: int = 30
+    retry_attempts: int = 3
+    face_request_workers: int = 8
+
+    @classmethod
+    def from_config(cls, config: "ConfigLoader") -> "ApiSettings":
+        connection = config.get_immich_config()
+        return cls(
+            base_url=connection["base_url"],
+            api_key=connection["api_key"],
+            **config.get_settings_config(),
+        )
+
+
+@dataclass(frozen=True)
+class XmpResult:
+    """Rendered text and its region counts; neither is an export-side effect."""
+
+    content: str
+    region_counts: Dict[str, int] = field(default_factory=dict)
+
+
+@dataclass
+class ExportStatistics:
+    """Count successful writes, including overwrites of a colliding path."""
+
+    files_created: int = 0
+    faces_processed: int = 0
+    people: Dict[str, int] = field(default_factory=dict)
+
+    def record_write(self, result: XmpResult) -> None:
+        self.files_created += 1
+        self.faces_processed += sum(result.region_counts.values())
+        for name, count in result.region_counts.items():
+            self.people[name] = self.people.get(name, 0) + count
+
+
+# --- Configuration and logging ---
 
 
 class CustomFormatter(logging.Formatter):
@@ -199,11 +263,7 @@ class ConfigLoader:
         logger.info(f"   XMP output directory: {self.get('output.xmp_export_dir')}")
 
 
-def get_config() -> ConfigLoader:
-    global _CONFIG_INSTANCE
-    if _CONFIG_INSTANCE is None:
-        _CONFIG_INSTANCE = ConfigLoader()
-    return _CONFIG_INSTANCE
+# --- Immich boundary: transport, search, face hydration ---
 
 
 def create_http_session(retries: int) -> requests.Session:
@@ -221,46 +281,308 @@ def create_http_session(retries: int) -> requests.Session:
     return session
 
 
-def api_request(
-    session: requests.Session,
-    method: str,
-    path: str,
-    *,
-    token: Optional[str] = None,
-    **kwargs: Any,
-) -> requests.Response:
-    """Issue an authenticated API request using either API key or access token."""
-    config = get_config()
-    immich_config = config.get_immich_config()
-    settings_config = config.get_settings_config()
+class ImmichClient:
+    """Own the connection and isolate the current Immich API contract.
 
-    headers = DEFAULT_HEADERS.copy()
-    api_key = immich_config.get("api_key")
-    if api_key:
-        headers["x-api-key"] = api_key
-    elif token:
-        headers["Cookie"] = f"immich_access_token={token}"
+    Request shape, response parsing, pagination and face hydration stay here.
+    A later structured-filter/cursor migration must not change the dictionaries
+    consumed by selection or the file writers. No future API path is enabled.
+    """
 
-    response = session.request(
-        method,
-        f"{immich_config['base_url'].rstrip('/')}/api{path}",
-        headers=headers,
-        timeout=settings_config["request_timeout"],
-        **kwargs,
+    def __init__(
+        self,
+        settings: ApiSettings,
+        *,
+        session: Optional[requests.Session] = None,
+        access_token: Optional[str] = None,
+    ):
+        self.settings = settings
+        self.access_token = access_token
+        # An injected session belongs to the caller; normal CLI sessions are owned.
+        self._owns_session = session is None
+        self.session = create_http_session(settings.retry_attempts) if session is None else session
+
+    def __enter__(self) -> "ImmichClient":
+        return self
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+        if self._owns_session:
+            self.session.close()
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        *,
+        session: Optional[requests.Session] = None,
+        **kwargs: Any,
+    ) -> requests.Response:
+        """Send a request using explicit settings and the current authentication."""
+        headers = DEFAULT_HEADERS.copy()
+        if self.settings.api_key:
+            headers["x-api-key"] = self.settings.api_key
+        elif self.access_token:
+            headers["Cookie"] = f"immich_access_token={self.access_token}"
+        transport = self.session if session is None else session
+        response = transport.request(
+            method,
+            f"{self.settings.base_url.rstrip('/')}/api{path}",
+            headers=headers,
+            timeout=self.settings.request_timeout,
+            **kwargs,
+        )
+        response.raise_for_status()
+        return response
+
+    def authenticate(self, email: str, password: str) -> Optional[str]:
+        """Log in once; subsequent requests use the returned access token."""
+        try:
+            self.access_token = self.request(
+                "POST", "/auth/login", json={"email": email, "password": password}
+            ).json()["accessToken"]
+            return self.access_token
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Authentication failed: {e}")
+        except (KeyError, json.JSONDecodeError) as e:
+            logger.error(f"Failed to parse authentication response: {e}")
+        return None
+
+    @staticmethod
+    def _search_payload(
+        page: int,
+        album_id: Optional[str],
+        library_id: Optional[str],
+        known_visible_only: bool,
+    ) -> Dict[str, Any]:
+        """Preserve the page-based request, without mixing in new fields."""
+        payload: Dict[str, Any] = {"page": page, "size": 1000, "withExif": True}
+        if known_visible_only:
+            payload["withPeople"] = True
+        if album_id:
+            payload["albumIds"] = [album_id]
+        if library_id:
+            payload["libraryId"] = library_id
+        return payload
+
+    @staticmethod
+    def _search_page(search_data: Any, page: int) -> Tuple[List[Dict[str, Any]], Optional[Any]]:
+        """Accept the existing nested and flat search response envelopes."""
+        assets_data = search_data.get("assets") if isinstance(search_data, dict) else None
+        assets_data = assets_data if assets_data is not None else search_data
+        if not isinstance(assets_data, dict):
+            raise ValueError(f"❌ Error: Unexpected search response shape on page {page} (expected dict)")
+        items = assets_data.get("items") or []
+        if not isinstance(items, list):
+            raise ValueError(f"❌ Error: Unexpected 'items' type on page {page} (expected list)")
+        return items, assets_data.get("nextPage")
+
+    @staticmethod
+    def _has_known_visible_person(item: Dict[str, Any]) -> bool:
+        """Cheap metadata prefilter, not the final face-selection predicate."""
+        return any(
+            (person.get("name") or "").strip().lower() not in ("", "unknown")
+            and not person.get("isHidden")
+            for person in item.get("people") or []
+            if isinstance(person, dict)
+        )
+
+    def get_asset_people(
+        self, asset_id: str, *, session: Optional[requests.Session] = None,
+    ) -> List[Dict[str, Any]]:
+        """Group faces by first-seen person without narrowing nested metadata."""
+        if not asset_id:
+            return []
+        faces = self.request("GET", "/faces", session=session, params={"id": asset_id}).json()
+        if not isinstance(faces, list):
+            raise ValueError(f"❌ Error: Unexpected faces response shape for asset {asset_id} (expected list)")
+        people_by_id: Dict[str, Dict[str, Any]] = {}
+        for face in faces:
+            if not isinstance(face, dict):
+                continue
+            person = face.get("person")
+            face_data = {key: value for key, value in face.items() if key != "person"}
+            if isinstance(person, dict) and person.get("id"):
+                person_data = people_by_id.setdefault(str(person["id"]), {**person, "faces": []})
+            else:
+                person_data = people_by_id.setdefault("__unknown__", {"name": "Unknown", "faces": []})
+            person_data["faces"].append(face_data)
+        return list(people_by_id.values())
+
+    def _page_people(self, items: List[Dict[str, Any]]) -> Iterator[List[Dict[str, Any]]]:
+        """Finish bounded page work, then expose ordered results, not futures.
+
+        Resolving results must remain lazy: a failed face lookup past max_assets
+        has run, but must not fail an export that never consumes that result.
+        Sessions are closed before returning, even if the iterator is abandoned.
+        """
+        if not items:
+            return iter(())
+        worker_count = min(self.settings.face_request_workers, len(items))
+        worker_sessions: Queue[requests.Session] = Queue()
+
+        def fetch_people(item: Dict[str, Any]) -> List[Dict[str, Any]]:
+            worker_session = worker_sessions.get()
+            try:
+                return self.get_asset_people(item.get("id", ""), session=worker_session)
+            finally:
+                worker_sessions.put(worker_session)
+
+        try:
+            for _ in range(worker_count):
+                worker_sessions.put(create_http_session(self.settings.retry_attempts))
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                futures = [executor.submit(fetch_people, item) for item in items]
+        finally:
+            while not worker_sessions.empty():
+                worker_sessions.get().close()
+
+        def resolve_people(future: Future) -> List[Dict[str, Any]]:
+            try:
+                return future.result()
+            except StopIteration as e:
+                # map/zip must not mistake a worker failure for normal exhaustion.
+                raise RuntimeError("Face lookup raised StopIteration") from e
+
+        return map(resolve_people, futures)
+
+    @staticmethod
+    def _export_record(item: Dict[str, Any], people: List[Dict[str, Any]]) -> ExportAsset:
+        """The same seven-field API projection as the original JSON format."""
+        return {
+            "asset_id": item.get("id", ""),
+            "original_path": item.get("originalPath", ""),
+            "file_name": item.get("originalFileName", "Unknown"),
+            "width": item.get("width"),
+            "height": item.get("height"),
+            "exifInfo": item.get("exifInfo") or {},
+            "people": people,
+        }
+
+    def iter_assets(
+        self,
+        *,
+        album_id: Optional[str] = None,
+        library_id: Optional[str] = None,
+        known_visible_only: bool = False,
+    ) -> Generator[ExportAsset, None, None]:
+        """Yield hydrated records in search order; pagination is private here."""
+        page = 1
+        while True:
+            try:
+                payload = self._search_payload(page, album_id, library_id, known_visible_only)
+                items, next_page = self._search_page(
+                    self.request("POST", "/search/metadata", json=payload).json(), page,
+                )
+                if not items:
+                    return
+                if known_visible_only:
+                    items = [item for item in items if self._has_known_visible_person(item)]
+                for item, people in zip(items, self._page_people(items)):
+                    yield self._export_record(item, people)
+                logger.debug(f"Finished processing page {page}")
+                if not next_page:
+                    return
+                try:
+                    page = int(next_page)
+                except (TypeError, ValueError):
+                    page += 1
+            except Exception as e:
+                logger.error(f"❌ Error collecting assets on page {page}: {e}")
+                raise
+
+
+# --- Export selection: shared by API and existing JSON records ---
+
+
+def normalize_people(raw_people: Any) -> List[Dict[str, Any]]:
+    """Keep only people that still have at least one face with a complete bounding box."""
+    people: List[Dict[str, Any]] = []
+    for person in raw_people or []:
+        faces = [
+            face
+            for face in (person.get("faces") or [])
+            if all(face.get(key) is not None for key in FACE_BOX_KEYS)
+        ]
+        if faces:
+            people.append({**person, "faces": faces})
+    return people
+
+
+def filter_asset_for_export(asset_data: Mapping[str, Any], export: str) -> Optional[Dict[str, Any]]:
+    """Return a copy of asset_data filtered for the selected export mode, or None to skip it."""
+    people = normalize_people(asset_data.get("people"))
+
+    if export == "assets-with-known-visible-faces":
+        visible_people: List[Dict[str, Any]] = []
+        for person in people:
+            person_name = (person.get("name") or "").strip()
+            if not person_name or person_name.lower() == "unknown" or person.get("isHidden"):
+                continue
+            faces = [
+                face
+                for face in (person.get("faces") or [])
+                if not face.get("isHidden") and face.get("isVisible", True) is not False
+            ]
+            if faces:
+                visible_people.append({**person, "faces": faces})
+        people = visible_people
+
+    if export != "all-assets" and not people:
+        return None
+
+    return {**asset_data, "people": people}
+
+
+def process_assets(
+    client: ImmichClient,
+    max_assets: Optional[int] = None,
+    album_id: Optional[str] = None,
+    library_id: Optional[str] = None,
+    export: str = "all-assets",
+) -> Iterator[Dict[str, Any]]:
+    """Apply export selection and its limit, without knowing the search protocol."""
+    yielded_assets = 0
+    export_label = {
+        "all-assets": "assets",
+        "assets-with-faces": "assets with faces",
+        "assets-with-known-visible-faces": "assets with known visible faces",
+    }.get(export, "assets")
+    logger.info(f"   Collecting {export_label}...")
+    records = client.iter_assets(
+        album_id=album_id,
+        library_id=library_id,
+        known_visible_only=export == "assets-with-known-visible-faces",
     )
-    response.raise_for_status()
-    return response
-
-
-def authenticate(session: requests.Session, email: str, password: str) -> Optional[str]:
-    """Authenticate with Immich API and return access token."""
     try:
-        return api_request(session, "POST", "/auth/login", json={"email": email, "password": password}).json()["accessToken"]
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Authentication failed: {e}")
-    except (KeyError, json.JSONDecodeError) as e:
-        logger.error(f"Failed to parse authentication response: {e}")
-    return None
+        # Check the selection limit BEFORE pulling the next hydrated result.
+        # A for-loop with a limit check in its body would consume one too many.
+        while max_assets is None or yielded_assets < max_assets:
+            try:
+                record = next(records)
+            except StopIteration:
+                break
+            asset_info = filter_asset_for_export(record, export)
+            if asset_info is None:
+                continue
+            yielded_assets += 1
+            people = asset_info.get("people") or []
+            if logger.isEnabledFor(logging.DEBUG):
+                total_faces = sum(len(person.get("faces") or []) for person in people)
+                logger.debug(
+                    f"Asset {yielded_assets}: {asset_info['file_name']} - "
+                    f"{len(people)} people, {total_faces} faces"
+                )
+            elif yielded_assets % 100 == 0:
+                logger.info(f"   Progress: Found {yielded_assets} {export_label}...")
+            yield asset_info
+        else:
+            logger.info(f"   Reached maximum asset limit: {max_assets}")
+    finally:
+        records.close()
+    logger.info(f"✅ Processing completed: Found {yielded_assets} {export_label}")
+
+
+# --- Pure XMP rendering: geometry, metadata, keywords and face regions ---
 
 
 def _parse_orientation(orientation: Any) -> int:
@@ -348,156 +670,10 @@ def _safe_int(value: Any) -> int:
         return 0
 
 
-def normalize_people(raw_people: Any) -> List[Dict[str, Any]]:
-    """Keep only people that still have at least one face with a complete bounding box."""
-    people: List[Dict[str, Any]] = []
-    for person in raw_people or []:
-        faces = [
-            face
-            for face in (person.get("faces") or [])
-            if all(face.get(key) is not None for key in FACE_BOX_KEYS)
-        ]
-        if faces:
-            people.append({**person, "faces": faces})
-    return people
-
-
-def filter_asset_for_export(asset_data: Dict[str, Any], export: str) -> Optional[Dict[str, Any]]:
-    """Return a copy of asset_data filtered for the selected export mode, or None to skip it."""
-    people = normalize_people(asset_data.get("people"))
-
-    if export == "assets-with-known-visible-faces":
-        visible_people: List[Dict[str, Any]] = []
-        for person in people:
-            person_name = (person.get("name") or "").strip()
-            if not person_name or person_name.lower() == "unknown" or person.get("isHidden"):
-                continue
-            faces = [
-                face
-                for face in (person.get("faces") or [])
-                if not face.get("isHidden") and face.get("isVisible", True) is not False
-            ]
-            if faces:
-                visible_people.append({**person, "faces": faces})
-        people = visible_people
-
-    if export != "all-assets" and not people:
-        return None
-
-    return {**asset_data, "people": people}
-
-
-def _extract_search_page_items(search_data: Any, page: int) -> Tuple[List[Dict[str, Any]], Optional[Any]]:
-    """Unify the slightly defensive search-response parsing in one small helper."""
-    assets_data = search_data.get("assets") if isinstance(search_data, dict) else None
-    assets_data = assets_data if assets_data is not None else search_data
-
-    if not isinstance(assets_data, dict):
-        raise ValueError(f"❌ Error: Unexpected search response shape on page {page} (expected dict)")
-
-    items = assets_data.get("items") or []
-    if not isinstance(items, list):
-        raise ValueError(f"❌ Error: Unexpected 'items' type on page {page} (expected list)")
-
-    return items, assets_data.get("nextPage")
-
-
-def get_asset_people(
-    session: requests.Session,
-    asset_id: str,
-    access_token: Optional[str] = None,
-) -> List[Dict[str, Any]]:
-    """Retrieve face data for an asset and group it by person."""
-    if not asset_id:
-        return []
-
-    faces = api_request(
-        session,
-        "GET",
-        "/faces",
-        token=access_token,
-        params={"id": asset_id},
-    ).json()
-    if not isinstance(faces, list):
-        raise ValueError(f"❌ Error: Unexpected faces response shape for asset {asset_id} (expected list)")
-
-    people_by_id: Dict[str, Dict[str, Any]] = {}
-    for face in faces:
-        if not isinstance(face, dict):
-            continue
-
-        person = face.get("person")
-        face_data = {key: value for key, value in face.items() if key != "person"}
-        if isinstance(person, dict) and person.get("id"):
-            person_data = people_by_id.setdefault(str(person["id"]), {**person, "faces": []})
-        else:
-            person_data = people_by_id.setdefault("__unknown__", {"name": "Unknown", "faces": []})
-        person_data["faces"].append(face_data)
-
-    return list(people_by_id.values())
-
-
-def get_page_asset_people(
-    items: List[Dict[str, Any]],
-    access_token: Optional[str],
-) -> List[Future]:
-    """Retrieve face data concurrently for one metadata page."""
-    if not items:
-        return []
-
-    settings_config = get_config().get_settings_config()
-    worker_count = min(settings_config["face_request_workers"], len(items))
-    worker_sessions: Queue[requests.Session] = Queue()
-    for _ in range(worker_count):
-        worker_sessions.put(create_http_session(settings_config["retry_attempts"]))
-
-    def fetch_people(item: Dict[str, Any]) -> List[Dict[str, Any]]:
-        worker_session = worker_sessions.get()
-        try:
-            return get_asset_people(worker_session, item.get("id", ""), access_token)
-        finally:
-            worker_sessions.put(worker_session)
-
-    try:
-        with ThreadPoolExecutor(max_workers=worker_count) as executor:
-            futures = [executor.submit(fetch_people, item) for item in items]
-    finally:
-        while not worker_sessions.empty():
-            worker_sessions.get().close()
-
-    return futures
-
-
-def create_xmp_content(
-    asset_data: Dict[str, Any],
-    require_face_regions: bool = False,
-    region_counts: Optional[Dict[str, int]] = None,
-) -> str:
-    """Create XMP content, optionally recording the face regions actually written."""
-    people = normalize_people(asset_data.get("people"))
-    exif_info = asset_data.get("exifInfo") or {}
-    now = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-
-    def xml_text(value: Any) -> str:
-        """Escape text for safe XML embedding (also safe for attribute values)."""
-        if value is None:
-            return ""
-        return _xml_escape(str(value), {'"': "&quot;", "'": "&apos;"})
-
-    def exif_str(key: str, default: str = "") -> str:
-        """Read EXIF value as string; returns default/empty for None."""
-        value = exif_info.get(key, default)
-        return "" if value is None else str(value)
-
-    def xmp_date(date_str: str) -> str:
-        """Ensure XMP date-time format (adds a dummy time if only date is present)."""
-        return date_str if not date_str or "T" in date_str else f"{date_str}T12:00:00"
-
-    def add_tag(lines: List[str], ns_tag: str, value: str) -> None:
-        """Append a simple <ns:Tag>value</ns:Tag> only when a value exists."""
-        if value:
-            lines.append(f"   <{ns_tag}>{xml_text(value)}</{ns_tag}>")
-
+def _resolve_image_geometry(
+    asset_data: Mapping[str, Any], people: List[Dict[str, Any]], exif_info: Dict[str, Any],
+) -> Tuple[int, int, int]:
+    """Resolve raw dimensions and orientation without modifying source metadata."""
     # MWG regions must be relative to the UNROTATED (raw) image dimensions.
     raw_w = _safe_int(exif_info.get("exifImageWidth")) or _safe_int(asset_data.get("width"))
     raw_h = _safe_int(exif_info.get("exifImageHeight")) or _safe_int(asset_data.get("height"))
@@ -519,8 +695,127 @@ def create_xmp_content(
             # If the ML canvas was sideways, flip back to the raw image orientation.
             raw_w, raw_h = (face_h, face_w) if orientation_val in [5, 6, 7, 8] else (face_w, face_h)
 
+    return raw_w, raw_h, orientation_val
+
+
+def _xml_text(value: Any) -> str:
+    """Escape both element text and attribute values using the original rules."""
+    return "" if value is None else _xml_escape(str(value), {'"': "&quot;", "'": "&apos;"})
+
+
+def _exif_text(exif_info: Dict[str, Any], key: str) -> str:
+    value = exif_info.get(key, "")
+    return "" if value is None else str(value)
+
+
+def _xmp_date(value: str) -> str:
+    return value if not value or "T" in value else f"{value}T12:00:00"
+
+
+def _append_tag(lines: List[str], tag: str, value: str) -> None:
+    if value:
+        lines.append(f"   <{tag}>{_xml_text(value)}</{tag}>")
+
+
+def _append_metadata_tags(
+    lines: List[str], asset_data: Mapping[str, Any], exif_info: Dict[str, Any], raw_w: int, raw_h: int,
+) -> None:
+    """Append camera, date, dimension, location and identity tags in stable order."""
+    for tag, key in (
+        ("tiff:Make", "make"),
+        ("tiff:Model", "model"),
+        ("exif:LensModel", "lensModel"),
+        ("exif:FNumber", "fNumber"),
+        ("exif:ExposureTime", "exposureTime"),
+        ("exif:ISOSpeedRatings", "iso"),
+        ("exif:FocalLength", "focalLength"),
+        ("photoshop:City", "city"),
+        ("photoshop:State", "state"),
+        ("photoshop:Country", "country"),
+    ):
+        _append_tag(lines, tag, _exif_text(exif_info, key))
+
+    for tag, value in (
+        ("exif:DateTimeOriginal", _xmp_date(_exif_text(exif_info, "dateTimeOriginal"))),
+        ("exif:DateTimeDigitized", _xmp_date(_exif_text(exif_info, "dateTimeDigitized"))),
+    ):
+        _append_tag(lines, tag, str(value))
+
+    if raw_w and raw_h:
+        for tag, value in (
+            ("tiff:ImageWidth", raw_w),
+            ("tiff:ImageLength", raw_h),
+            ("exif:ExifImageWidth", raw_w),
+            ("exif:ExifImageHeight", raw_h),
+        ):
+            _append_tag(lines, tag, str(value))
+
+    latitude = _exif_text(exif_info, "latitude")
+    longitude = _exif_text(exif_info, "longitude")
+    if latitude and longitude:
+        _append_tag(lines, "exif:GPSLatitude", latitude)
+        _append_tag(lines, "exif:GPSLongitude", longitude)
+
+    file_name = asset_data.get("file_name") or asset_data.get("originalFileName") or ""
+    _append_tag(lines, "xmp:Identifier", file_name)
+    lines.append("   <xmp:CreatorTool>Immich XMP Export Tool</xmp:CreatorTool>")
+
+
+def _render_face_regions(
+    people: List[Dict[str, Any]], raw_w: int, raw_h: int, orientation_val: int,
+) -> Tuple[List[str], Dict[str, int]]:
+    """Render valid rectangles and count only the regions present in the text."""
+    lines: List[str] = []
+    region_counts: Dict[str, int] = {}
+    if not people or not raw_w or not raw_h:
+        return lines, region_counts
+    lines.extend([
+        '   <mwg-rs:Regions rdf:parseType="Resource">',
+        "    <mwg-rs:AppliedToDimensions",
+        f'     stDim:w="{raw_w}"',
+        f'     stDim:h="{raw_h}"',
+        '     stDim:unit="pixel"/>',
+        "    <mwg-rs:RegionList>",
+        "    <rdf:Bag>",
+    ])
+    for person in people:
+        person_name = (person.get("name") or "Unknown").strip() or "Unknown"
+        for face in person.get("faces") or []:
+            raw_cx, raw_cy, raw_fw, raw_fh = _calculate_unrotated_face_coords(face, orientation_val, raw_w, raw_h)
+            if raw_fw <= 0.0 or raw_fh <= 0.0:
+                continue
+            lines.extend([
+                "     <rdf:li>",
+                "      <rdf:Description",
+                f'       mwg-rs:Name="{_xml_text(person_name)}"',
+                '       mwg-rs:Type="Face">',
+                "       <mwg-rs:Area",
+                f'        stArea:x="{raw_cx:.6f}"',
+                f'        stArea:y="{raw_cy:.6f}"',
+                f'        stArea:w="{raw_fw:.6f}"',
+                f'        stArea:h="{raw_fh:.6f}"',
+                '        stArea:unit="normalized"/>',
+                "      </rdf:Description>",
+                "     </rdf:li>",
+            ])
+            region_counts[person_name] = region_counts.get(person_name, 0) + 1
+    lines.extend(["    </rdf:Bag>", "    </mwg-rs:RegionList>", "   </mwg-rs:Regions>"])
+    return lines, region_counts
+
+
+def render_xmp(
+    asset_data: Mapping[str, Any],
+    *,
+    now: datetime,
+    require_face_regions: bool = False,
+) -> XmpResult:
+    """Render one record with an explicit clock value and no external mutation."""
+    people = normalize_people(asset_data.get("people"))
+    exif_info = asset_data.get("exifInfo") or {}
+    timestamp = now.strftime("%Y-%m-%dT%H:%M:%S")
+    raw_w, raw_h, orientation_val = _resolve_image_geometry(asset_data, people, exif_info)
     if require_face_regions and (not people or not raw_w or not raw_h):
-        return ""
+        return XmpResult("")
 
     lines = f"""<?xml version="1.0" encoding="UTF-8"?>
 <x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="XMP Core 4.4.0">
@@ -536,103 +831,21 @@ def create_xmp_content(
    xmlns:Iptc4xmpCore="http://iptc.org/std/Iptc4xmpCore/1.0/xmlns/"
    xmlns:stDim="http://ns.adobe.com/xap/1.0/sType/Dimensions#"
    xmlns:stArea="http://ns.adobe.com/xmp/sType/Area#"
-   xmp:ModifyDate="{now}"
-   xmp:MetadataDate="{now}">""".splitlines()
+   xmp:ModifyDate="{timestamp}"
+   xmp:MetadataDate="{timestamp}">""".splitlines()
 
-    for tag, key in (
-        ("tiff:Make", "make"),
-        ("tiff:Model", "model"),
-        ("exif:LensModel", "lensModel"),
-        ("exif:FNumber", "fNumber"),
-        ("exif:ExposureTime", "exposureTime"),
-        ("exif:ISOSpeedRatings", "iso"),
-        ("exif:FocalLength", "focalLength"),
-        ("photoshop:City", "city"),
-        ("photoshop:State", "state"),
-        ("photoshop:Country", "country"),
-    ):
-        add_tag(lines, tag, exif_str(key))
-
-    for tag, value in (
-        ("exif:DateTimeOriginal", xmp_date(exif_str("dateTimeOriginal"))),
-        ("exif:DateTimeDigitized", xmp_date(exif_str("dateTimeDigitized"))),
-    ):
-        add_tag(lines, tag, str(value))
-
-    if raw_w and raw_h:
-        for tag, value in (
-            ("tiff:ImageWidth", raw_w),
-            ("tiff:ImageLength", raw_h),
-            ("exif:ExifImageWidth", raw_w),
-            ("exif:ExifImageHeight", raw_h),
-        ):
-            add_tag(lines, tag, str(value))
-
-    latitude = exif_str("latitude")
-    longitude = exif_str("longitude")
-    if latitude and longitude:
-        add_tag(lines, "exif:GPSLatitude", latitude)
-        add_tag(lines, "exif:GPSLongitude", longitude)
-
-    file_name = asset_data.get("file_name") or asset_data.get("originalFileName") or ""
-    add_tag(lines, "xmp:Identifier", file_name)
-    lines.append("   <xmp:CreatorTool>Immich XMP Export Tool</xmp:CreatorTool>")
+    _append_metadata_tags(lines, asset_data, exif_info, raw_w, raw_h)
 
     unique_people = sorted({(person.get("name") or "").strip() for person in people} - {"", "Unknown"})
     if unique_people:
         lines.extend(["   <dc:subject>", "    <rdf:Bag>"])
-        lines.extend(f"     <rdf:li>{xml_text(name)}</rdf:li>" for name in unique_people)
+        lines.extend(f"     <rdf:li>{_xml_text(name)}</rdf:li>" for name in unique_people)
         lines.extend(["    </rdf:Bag>", "   </dc:subject>"])
 
-    if people and raw_w and raw_h:
-        lines.extend(
-            [
-                '   <mwg-rs:Regions rdf:parseType="Resource">',
-                "    <mwg-rs:AppliedToDimensions",
-                f'     stDim:w="{raw_w}"',
-                f'     stDim:h="{raw_h}"',
-                '     stDim:unit="pixel"/>',
-                "    <mwg-rs:RegionList>",
-                "    <rdf:Bag>",
-            ]
-        )
-
-        regions_written = 0
-        for person in people:
-            person_name = (person.get("name") or "Unknown").strip() or "Unknown"
-            for face in person.get("faces") or []:
-                raw_cx, raw_cy, raw_fw, raw_fh = _calculate_unrotated_face_coords(face, orientation_val, raw_w, raw_h)
-                if raw_fw <= 0.0 or raw_fh <= 0.0:
-                    continue
-                lines.extend(
-                    [
-                        "     <rdf:li>",
-                        "      <rdf:Description",
-                        f'       mwg-rs:Name="{xml_text(person_name)}"',
-                        '       mwg-rs:Type="Face">',
-                        "       <mwg-rs:Area",
-                        f'        stArea:x="{raw_cx:.6f}"',
-                        f'        stArea:y="{raw_cy:.6f}"',
-                        f'        stArea:w="{raw_fw:.6f}"',
-                        f'        stArea:h="{raw_fh:.6f}"',
-                        '        stArea:unit="normalized"/>',
-                        "      </rdf:Description>",
-                        "     </rdf:li>",
-                    ]
-                )
-                regions_written += 1
-                if region_counts is not None:
-                    region_counts[person_name] = region_counts.get(person_name, 0) + 1
-
-        if require_face_regions and regions_written == 0:
-            return ""
-
-        lines.extend(
-            """    </rdf:Bag>
-    </mwg-rs:RegionList>
-   </mwg-rs:Regions>
-""".splitlines()
-        )
+    region_lines, region_counts = _render_face_regions(people, raw_w, raw_h, orientation_val)
+    if require_face_regions and not region_counts:
+        return XmpResult("")
+    lines.extend(region_lines)
 
     lines.extend(
         """  </rdf:Description>
@@ -640,7 +853,10 @@ def create_xmp_content(
 </x:xmpmeta>
 """.splitlines()
     )
-    return "\n".join(lines)
+    return XmpResult("\n".join(lines), region_counts)
+
+
+# --- Filesystem boundary: sidecars, streaming JSON, export accounting ---
 
 
 def save_xmp_sidecar(original_path: str, xmp_content: str, output_dir: str = "") -> bool:
@@ -685,135 +901,17 @@ def save_xmp_sidecar(original_path: str, xmp_content: str, output_dir: str = "")
         return False
 
 
-def process_assets(
-    session: requests.Session,
-    access_token: Optional[str] = None,
-    max_assets: Optional[int] = None,
-    album_id: Optional[str] = None,
-    library_id: Optional[str] = None,
-    export: str = "all-assets",
-) -> Iterator[Dict[str, Any]]:
-    """Yield assets filtered according to the selected export mode."""
-    page = 1
-    progress_interval = 100
-    yielded_assets = 0
-    export_label = {
-        "all-assets": "assets",
-        "assets-with-faces": "assets with faces",
-        "assets-with-known-visible-faces": "assets with known visible faces",
-    }.get(export, "assets")
-
-    logger.info(f"   Collecting {export_label}...")
-
-    while True:
-        if max_assets is not None and yielded_assets >= max_assets:
-            logger.info(f"   Reached maximum asset limit: {max_assets}")
-            break
-
-        try:
-            search_payload = {
-                "page": page,
-                "size": 1000,  # Fetch 1000 fully-populated assets at once.
-                "withExif": True,  # Embed the EXIF data directly in this list response.
-            }
-            if export == "assets-with-known-visible-faces":
-                search_payload["withPeople"] = True
-            if album_id:
-                search_payload["albumIds"] = [album_id]
-            if library_id:
-                search_payload["libraryId"] = library_id
-
-            # The search endpoint acts as searchAssets when payload matches metadata parameters.
-            items, next_page = _extract_search_page_items(
-                api_request(
-                    session,
-                    "POST",
-                    "/search/metadata",
-                    token=access_token,
-                    json=search_payload,
-                ).json(),
-                page,
-            )
-            if not items:
-                break
-
-            if export == "assets-with-known-visible-faces":
-                items = [
-                    item
-                    for item in items
-                    if any(
-                        (person.get("name") or "").strip().lower() not in ("", "unknown")
-                        and not person.get("isHidden")
-                        for person in item.get("people") or []
-                        if isinstance(person, dict)
-                    )
-                ]
-
-            people_futures = get_page_asset_people(items, access_token)
-
-            for item, people_future in zip(items, people_futures):
-                if max_assets is not None and yielded_assets >= max_assets:
-                    break
-
-                file_name = item.get("originalFileName", "Unknown")
-                asset_info = filter_asset_for_export(
-                    {
-                        "asset_id": item.get("id", ""),
-                        "original_path": item.get("originalPath", ""),
-                        "file_name": file_name,
-                        "width": item.get("width"),
-                        "height": item.get("height"),
-                        "exifInfo": item.get("exifInfo") or {},
-                        "people": people_future.result(),
-                    },
-                    export,
-                )
-                if asset_info is None:
-                    continue
-
-                yielded_assets += 1
-                normalized_people = asset_info.get("people") or []
-                total_faces = sum(len(person.get("faces") or []) for person in normalized_people)
-
-                if logger.isEnabledFor(logging.DEBUG):
-                    logger.debug(
-                        f"Asset {yielded_assets}: {file_name} - "
-                        f"{len(normalized_people)} people, {total_faces} faces"
-                    )
-                elif progress_interval and yielded_assets % progress_interval == 0:
-                    logger.info(f"   Progress: Found {yielded_assets} {export_label}...")
-
-                yield asset_info
-
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug(f"Finished processing page {page}")
-
-            if not next_page:
-                break
-
-            try:
-                page = int(next_page)
-            except (TypeError, ValueError):
-                page += 1
-        except Exception as e:
-            logger.error(f"❌ Error collecting assets on page {page}: {e}")
-            raise
-
-    logger.info(f"✅ Processing completed: Found {yielded_assets} {export_label}")
-
-
-def export_assets_to_json(
-    session: requests.Session,
-    access_token: Optional[str] = None,
-    json_output_dir: str = "json_exports",
-    max_assets: Optional[int] = None,
-    album_id: Optional[str] = None,
-    library_id: Optional[str] = None,
-    export: str = "all-assets",
+def write_assets_json(
+    assets: Iterable[Dict[str, Any]],
+    json_output_dir: str,
+    *,
+    immich_server: str,
 ) -> Optional[str]:
-    """Export asset data to JSON file (Stage 1) without holding the full library in memory."""
-    logger.info("\n   Starting export to JSON format (Stage 1)...")
+    """Spool records one at a time, then atomically publish the complete JSON.
 
+    The spool is necessary because the header precedes the final selected count.
+    A failed rerun must leave any previous final export untouched.
+    """
     output_path = Path(json_output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
@@ -827,7 +925,7 @@ def export_assets_to_json(
     try:
         with open(assets_tmp_path, "w", encoding="utf-8") as assets_file:
             first_asset = True
-            for asset_info in process_assets(session, access_token, max_assets, album_id, library_id, export):
+            for asset_info in assets:
                 if not first_asset:
                     assets_file.write(",\n")
                 json.dump(asset_info, assets_file, ensure_ascii=False, separators=(",", ":"))
@@ -841,7 +939,7 @@ def export_assets_to_json(
         with open(json_tmp_path, "w", encoding="utf-8") as out_file, open(assets_tmp_path, "r", encoding="utf-8") as assets_file:
             out_file.write("{\n")
             out_file.write(f'  "export_timestamp": {json.dumps(datetime.now().isoformat(), ensure_ascii=False)},\n')
-            out_file.write(f'  "immich_server": {json.dumps(get_config().get_immich_config()["base_url"].rstrip("/"), ensure_ascii=False)},\n')
+            out_file.write(f'  "immich_server": {json.dumps(immich_server.rstrip("/"), ensure_ascii=False)},\n')
             out_file.write(f'  "total_assets": {total_assets},\n')
             out_file.write('  "assets": [\n')
             while True:
@@ -871,6 +969,48 @@ def export_assets_to_json(
                 pass
 
 
+def _write_export_summary(
+    stats: ExportStatistics,
+    output_path: Path,
+    total_assets: int,
+    json_source: Optional[str],
+    top_people_to_print: int,
+) -> None:
+    """Preserve summary shape, ordering and its nonfatal write-error policy."""
+    summary_file = output_path / "export_summary.json"
+    summary_data: Dict[str, Any] = {
+        "export_timestamp": datetime.now().isoformat(),
+        "total_assets": total_assets,
+        "total_xmp_files_created": stats.files_created,
+        "total_faces_processed": stats.faces_processed,
+        "unique_people": len(stats.people),
+        "people_statistics": stats.people,
+        "output_directory": str(output_path.absolute()),
+    }
+    if json_source:
+        summary_data["json_source"] = json_source
+
+    try:
+        with open(summary_file, "w", encoding="utf-8") as f:
+            json.dump(summary_data, f, indent=2, ensure_ascii=False)
+    except IOError as e:
+        logger.error(f"❌ Error saving summary file: {e}")
+
+    logger.info("✅ XMP export completed!")
+    logger.info("\n📊 Statistics:")
+    logger.info(f"   Total assets processed: {total_assets}")
+    logger.info(f"   XMP sidecar files created: {stats.files_created}")
+    logger.info(f"   Total faces processed: {stats.faces_processed}")
+    logger.info(f"   Unique people: {len(stats.people)}")
+    logger.info(f"   Output directory: {output_path.absolute()}")
+    logger.info(f"   Summary file: {summary_file.absolute()}")
+
+    if stats.people:
+        logger.info(f"\n👥 People found (top {top_people_to_print}):")
+        for person, count in sorted(stats.people.items(), key=lambda item: item[1], reverse=True)[:top_people_to_print]:
+            logger.info(f"   {person}: {count} faces")
+
+
 def write_xmp_for_assets(
     assets: Iterable[Dict[str, Any]],
     output_dir: str = "xmp_sidecars",
@@ -891,10 +1031,8 @@ def write_xmp_for_assets(
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    total_files_created = 0
-    total_faces_processed = 0
+    stats = ExportStatistics()
     processed_count = 0
-    person_stats: Dict[str, int] = {}
     require_face_regions = export != "all-assets"
 
     count_label = f"for {total_assets} assets" if total_assets else "for streamed assets"
@@ -904,8 +1042,8 @@ def write_xmp_for_assets(
     try:
         for processed_count, asset_data in enumerate(assets, 1):
             file_label = asset_data.get("file_name") or asset_data.get("originalFileName") or "Unknown"
-            region_counts: Dict[str, int] = {}
-            xmp_content = create_xmp_content(asset_data, require_face_regions, region_counts)
+            rendered = render_xmp(asset_data, now=datetime.now(), require_face_regions=require_face_regions)
+            xmp_content = rendered.content
             if not xmp_content.strip():
                 logger.warning(f"   Warning: Empty XMP content for asset {file_label}")
             else:
@@ -913,10 +1051,7 @@ def write_xmp_for_assets(
                 original_path = asset_data.get("original_path") or asset_data.get("originalPath") or f"unknown_{asset_id}.jpg"
 
                 if save_xmp_sidecar(original_path, xmp_content, str(output_path)):
-                    total_files_created += 1
-                    total_faces_processed += sum(region_counts.values())
-                    for person_name, face_count in region_counts.items():
-                        person_stats[person_name] = person_stats.get(person_name, 0) + face_count
+                    stats.record_write(rendered)
 
             if progress_every and processed_count % progress_every == 0:
                 suffix = f"/{total_assets}" if total_assets else ""
@@ -929,44 +1064,33 @@ def write_xmp_for_assets(
         logger.warning("No assets found")
         return False
 
-    summary_file = output_path / "export_summary.json"
-    summary_data: Dict[str, Any] = {
-        "export_timestamp": datetime.now().isoformat(),
-        "total_assets": total_assets or processed_count,
-        "total_xmp_files_created": total_files_created,
-        "total_faces_processed": total_faces_processed,
-        "unique_people": len(person_stats),
-        "people_statistics": person_stats,
-        "output_directory": str(output_path.absolute()),
-    }
-    if json_source:
-        summary_data["json_source"] = json_source
+    _write_export_summary(stats, output_path, total_assets or processed_count, json_source, top_people_to_print)
 
-    try:
-        with open(summary_file, "w", encoding="utf-8") as f:
-            json.dump(summary_data, f, indent=2, ensure_ascii=False)
-    except IOError as e:
-        logger.error(f"❌ Error saving summary file: {e}")
-
-    logger.info("✅ XMP export completed!")
-    logger.info("\n📊 Statistics:")
-    logger.info(f"   Total assets processed: {total_assets or processed_count}")
-    logger.info(f"   XMP sidecar files created: {total_files_created}")
-    logger.info(f"   Total faces processed: {total_faces_processed}")
-    logger.info(f"   Unique people: {len(person_stats)}")
-    logger.info(f"   Output directory: {output_path.absolute()}")
-    logger.info(f"   Summary file: {summary_file.absolute()}")
-
-    if person_stats:
-        logger.info(f"\n👥 People found (top {top_people_to_print}):")
-        for person, count in sorted(person_stats.items(), key=lambda item: item[1], reverse=True)[:top_people_to_print]:
-            logger.info(f"   {person}: {count} faces")
-
-    if total_files_created == 0:
+    if stats.files_created == 0:
         logger.error("\n❌ No XMP files were created (all assets were skipped or writes failed).")
         return False
 
     return True
+
+
+# --- Workflows and command-line entry point ---
+
+
+def export_assets_to_json(
+    client: ImmichClient,
+    json_output_dir: str = "json_exports",
+    max_assets: Optional[int] = None,
+    album_id: Optional[str] = None,
+    library_id: Optional[str] = None,
+    export: str = "all-assets",
+) -> Optional[str]:
+    """Stage 1: stream selected API records to the intermediate JSON writer."""
+    logger.info("\n   Starting export to JSON format (Stage 1)...")
+    return write_assets_json(
+        process_assets(client, max_assets, album_id, library_id, export),
+        json_output_dir,
+        immich_server=client.settings.base_url,
+    )
 
 
 def export_assets_to_xmp_from_json(
@@ -1005,8 +1129,7 @@ def export_assets_to_xmp_from_json(
 
 
 def export_assets_to_xmp(
-    session: requests.Session,
-    access_token: Optional[str] = None,
+    client: ImmichClient,
     output_dir: str = "xmp_sidecars",
     max_assets: Optional[int] = None,
     album_id: Optional[str] = None,
@@ -1016,7 +1139,7 @@ def export_assets_to_xmp(
     """Direct one-stage export: stream Immich API results straight to XMP sidecars."""
     logger.info("   Starting DIRECT export to XMP format (API -> XMP, no JSON)...")
     return write_xmp_for_assets(
-        process_assets(session, access_token, max_assets, album_id, library_id, export),
+        process_assets(client, max_assets, album_id, library_id, export),
         output_dir,
         export=export,
     )
@@ -1091,7 +1214,7 @@ def main() -> None:
     if args.stage2_only:
         logger.info("Running Stage 2 only: Generate XMP from JSON file")
         logger.info(f"   Export mode: {args.export}")
-        xmp_dir = args.xmp_dir or get_config().get_output_config()["xmp_export_dir"]
+        xmp_dir = args.xmp_dir or ConfigLoader().get_output_config()["xmp_export_dir"]
         success = export_assets_to_xmp_from_json(args.json_file, xmp_dir, args.export)
         if success:
             logger.info("\n🎉 XMP files generated successfully from JSON!")
@@ -1100,13 +1223,12 @@ def main() -> None:
             logger.error("\n❌ Failed to generate XMP files from JSON")
         return
 
-    config = get_config()
+    config = ConfigLoader()
     config.log_config_summary()
     if not config.validate_immich_config():
         return
 
     output_config = config.get_output_config()
-    settings_config = config.get_settings_config()
     immich_config = config.get_immich_config()
 
     json_dir = args.json_dir or output_config["json_export_dir"]
@@ -1118,38 +1240,43 @@ def main() -> None:
     if args.max_assets:
         logger.info(f"   Maximum assets to process: {args.max_assets}")
 
-    session = create_http_session(settings_config["retry_attempts"])
-    access_token = None if immich_config["api_key"] else authenticate(session, immich_config["email"], immich_config["password"])
-    if not immich_config["api_key"] and not access_token:
-        logger.error("❌ Authentication failed. Please check your credentials and server URL.")
-        return
+    with ImmichClient(ApiSettings.from_config(config)) as client:
+        if not immich_config["api_key"] and not client.authenticate(immich_config["email"], immich_config["password"]):
+            logger.error("❌ Authentication failed. Please check your credentials and server URL.")
+            return
 
-    if args.direct_xmp:
-        logger.info("\n   Running direct XMP export (single stage): API -> XMP (no intermediate JSON)")
-        success = export_assets_to_xmp(session, access_token, xmp_dir, args.max_assets, args.album_id, args.library_id, args.export)
-        if success:
-            logger.info("\n🎉 Direct XMP export completed successfully!")
-            logger.info(f"   XMP files: {Path(xmp_dir).absolute()}")
+        if args.direct_xmp:
+            logger.info("\n   Running direct XMP export (single stage): API -> XMP (no intermediate JSON)")
+            success = export_assets_to_xmp(
+                client, xmp_dir, max_assets=args.max_assets, album_id=args.album_id,
+                library_id=args.library_id, export=args.export,
+            )
+            if success:
+                logger.info("\n🎉 Direct XMP export completed successfully!")
+                logger.info(f"   XMP files: {Path(xmp_dir).absolute()}")
+            else:
+                logger.error("\n❌ Direct XMP export failed")
+            return
+
+        json_file_path = export_assets_to_json(
+            client, json_dir, max_assets=args.max_assets, album_id=args.album_id,
+            library_id=args.library_id, export=args.export,
+        )
+        if not json_file_path:
+            logger.error("❌ Failed to export asset data to JSON")
+            return
+
+        if args.stage1_only:
+            logger.info("\n🎉 Stage 1 completed successfully!")
+            logger.info(f"   JSON file created: {json_file_path}")
+            logger.info("   Use this file with --stage2-only --json-file to generate XMP files later.")
+            return
+
+        logger.info("\n   Proceeding to Stage 2: Generate XMP files from JSON...")
+        if export_assets_to_xmp_from_json(json_file_path, xmp_dir, args.export):
+            logger.info("\n🎉 Both stages completed successfully!")
         else:
-            logger.error("\n❌ Direct XMP export failed")
-        return
-
-    json_file_path = export_assets_to_json(session, access_token, json_dir, args.max_assets, args.album_id, args.library_id, args.export)
-    if not json_file_path:
-        logger.error("❌ Failed to export asset data to JSON")
-        return
-
-    if args.stage1_only:
-        logger.info("\n🎉 Stage 1 completed successfully!")
-        logger.info(f"   JSON file created: {json_file_path}")
-        logger.info("   Use this file with --stage2-only --json-file to generate XMP files later.")
-        return
-
-    logger.info("\n   Proceeding to Stage 2: Generate XMP files from JSON...")
-    if export_assets_to_xmp_from_json(json_file_path, xmp_dir, args.export):
-        logger.info("\n🎉 Both stages completed successfully!")
-    else:
-        logger.error("\n❌ Failed to generate XMP files from JSON")
+            logger.error("\n❌ Failed to generate XMP files from JSON")
 
 
 if __name__ == "__main__":
