@@ -4,10 +4,11 @@
 Configuration is loaded at the CLI boundary. ImmichClient owns HTTP and the
 search protocol; export records are ordinary dictionaries shared by the
 API and offline JSON paths. Selection and XMP rendering do not perform I/O.
-The writers preserve record ordering and report incomplete exports as failures.
+JSON exports use deterministic ordering; incomplete exports report failure.
 """
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -16,6 +17,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from queue import Queue
+from tempfile import TemporaryDirectory
 from typing import Any, Dict, Generator, Iterable, Iterator, List, Mapping, Optional, Tuple, TypedDict
 from xml.sax.saxutils import escape as _xml_escape
 
@@ -918,15 +920,42 @@ def save_xmp_sidecar(
         return False
 
 
+def _stable_json(value: Any) -> str:
+    """Keep all values and array order while sorting JSON object keys."""
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _json_id_order(value: Any) -> Tuple[str, str]:
+    """Use content to break ties for missing or duplicate person/face IDs."""
+    identifier = value.get("id") if isinstance(value, dict) else None
+    return str(identifier or ""), _stable_json(value)
+
+
+def _ordered_asset_json(asset: Mapping[str, Any]) -> str:
+    """Sort only people and face arrays, without changing the source record."""
+    ordered = dict(asset)
+    if isinstance(asset.get("people"), list):
+        people = []
+        for person in asset["people"]:
+            if isinstance(person, dict):
+                person = dict(person)
+                if isinstance(person.get("faces"), list):
+                    person["faces"] = sorted(person["faces"], key=_json_id_order)
+            people.append(person)
+        ordered["people"] = sorted(people, key=_json_id_order)
+    return _stable_json(ordered)
+
+
 def write_assets_json(
     assets: Iterable[Dict[str, Any]],
     json_output_dir: str,
     *,
     immich_server: str,
 ) -> Optional[str]:
-    """Spool records one at a time, then atomically publish the complete JSON.
+    """Sort selected records on disk, then atomically publish the complete JSON.
 
-    The spool is necessary because the header precedes the final selected count.
+    Selection and limits are applied upstream. Metadata stays in a temporary
+    JSON file; memory holds only paths, IDs, content hashes and file offsets.
     A failed rerun must leave any previous final export untouched.
     """
     output_path = Path(json_output_dir)
@@ -935,36 +964,47 @@ def write_assets_json(
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     json_filename = f"immich_assets_export_{timestamp}.json"
     json_file_path = output_path / json_filename
-    assets_tmp_path = output_path / f".{json_filename}.assets.tmp"
     json_tmp_path = output_path / f".{json_filename}.json.tmp"
 
     total_assets = 0
     try:
-        with open(assets_tmp_path, "w", encoding="utf-8") as assets_file:
-            first_asset = True
-            for asset_info in assets:
-                if not first_asset:
-                    assets_file.write(",\n")
-                json.dump(asset_info, assets_file, ensure_ascii=False, separators=(",", ":"))
-                first_asset = False
-                total_assets += 1
+        with TemporaryDirectory(prefix=".immich-export-", dir=output_path) as temporary_dir:
+            # Binary offsets work consistently with Unicode and Windows newlines.
+            with open(Path(temporary_dir) / "assets.jsonl", "w+b") as assets_file:
+                index: List[Tuple[str, str, bytes, int, int]] = []
+                for asset_info in assets:
+                    content = _ordered_asset_json(asset_info).encode("utf-8")
+                    original_path = str(asset_info.get("original_path") or asset_info.get("originalPath") or "")
+                    asset_id = str(asset_info.get("asset_id") or asset_info.get("id") or "")
+                    offset = assets_file.tell()
+                    assets_file.write(content + b"\n")
+                    # The digest breaks path/ID ties without retaining metadata.
+                    index.append((original_path, asset_id, hashlib.sha256(content).digest(), offset, len(content)))
+                    total_assets += 1
 
-        if total_assets == 0:
-            logger.warning("No matching assets found")
-            return None
+                if total_assets == 0:
+                    logger.warning("No matching assets found")
+                    return None
 
-        with open(json_tmp_path, "w", encoding="utf-8") as out_file, open(assets_tmp_path, "r", encoding="utf-8") as assets_file:
-            out_file.write("{\n")
-            out_file.write(f'  "export_timestamp": {json.dumps(datetime.now().isoformat(), ensure_ascii=False)},\n')
-            out_file.write(f'  "immich_server": {json.dumps(immich_server.rstrip("/"), ensure_ascii=False)},\n')
-            out_file.write(f'  "total_assets": {total_assets},\n')
-            out_file.write('  "assets": [\n')
-            while True:
-                chunk = assets_file.read(1024 * 1024)
-                if not chunk:
-                    break
-                out_file.write(chunk)
-            out_file.write("\n  ]\n}\n")
+                assets_file.flush()
+                index.sort(key=lambda entry: entry[:3])
+                with open(json_tmp_path, "w", encoding="utf-8") as out_file:
+                    out_file.write("{\n")
+                    out_file.write(f'  "export_timestamp": {json.dumps(datetime.now().isoformat(), ensure_ascii=False)},\n')
+                    out_file.write(f'  "immich_server": {json.dumps(immich_server.rstrip("/"), ensure_ascii=False)},\n')
+                    out_file.write(f'  "total_assets": {total_assets},\n')
+                    out_file.write('  "assets": [\n')
+                    first_asset = True
+                    for _, _, _, offset, length in index:
+                        assets_file.seek(offset)
+                        content = assets_file.read(length)
+                        if len(content) != length:
+                            raise OSError("Incomplete asset record in temporary JSON file")
+                        if not first_asset:
+                            out_file.write(",\n")
+                        out_file.write(content.decode("utf-8"))
+                        first_asset = False
+                    out_file.write("\n  ]\n}\n")
 
         json_tmp_path.replace(json_file_path)
 
@@ -978,12 +1018,10 @@ def write_assets_json(
         logger.error(f"❌ Error exporting JSON file: {e}")
         return None
     finally:
-        for tmp_path in (assets_tmp_path, json_tmp_path):
-            try:
-                if tmp_path.exists():
-                    tmp_path.unlink()
-            except OSError:
-                pass
+        try:
+            json_tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _write_export_summary(
