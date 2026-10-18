@@ -4,7 +4,7 @@
 Configuration is loaded at the CLI boundary. ImmichClient owns HTTP and the
 search protocol; export records are ordinary dictionaries shared by the
 API and offline JSON paths. Selection and XMP rendering do not perform I/O.
-The writers preserve the original formats, ordering and partial-failure policy.
+The writers preserve record ordering and report incomplete exports as failures.
 """
 
 import argparse
@@ -87,7 +87,7 @@ class XmpResult:
 
 @dataclass
 class ExportStatistics:
-    """Count successful writes, including overwrites of a colliding path."""
+    """Count distinct sidecars successfully written during this export."""
 
     files_created: int = 0
     faces_processed: int = 0
@@ -859,7 +859,13 @@ def render_xmp(
 # --- Filesystem boundary: sidecars, streaming JSON, export accounting ---
 
 
-def save_xmp_sidecar(original_path: str, xmp_content: str, output_dir: str = "") -> bool:
+def save_xmp_sidecar(
+    original_path: str,
+    xmp_content: str,
+    output_dir: str = "",
+    *,
+    used_paths: Optional[Dict[Path, str]] = None,
+) -> bool:
     """Save XMP content to sidecar file, creating same directory structure in output_dir."""
     if not xmp_content.strip():
         return False  # Skip empty XMP
@@ -887,10 +893,21 @@ def save_xmp_sidecar(original_path: str, xmp_content: str, output_dir: str = "")
             xmp_path = candidate.resolve(strict=False)
             if base_resolved != xmp_path and base_resolved not in xmp_path.parents:
                 raise ValueError(f"❌ Refusing to write outside output directory: {xmp_path}")
-            xmp_path.parent.mkdir(parents=True, exist_ok=True)
         else:
             xmp_path = Path(filename)
 
+        # Reserve each resolved destination once per export, even if its write
+        # fails. A later asset must not silently take over that destination.
+        if used_paths is not None:
+            path_key = xmp_path.resolve(strict=False)
+            if path_key in used_paths:
+                raise ValueError(
+                    f"Path collision: {original_path!r} and {used_paths[path_key]!r} "
+                    f"map to {xmp_path}; skipping the later asset"
+                )
+            used_paths[path_key] = str(original_path)
+
+        xmp_path.parent.mkdir(parents=True, exist_ok=True)
         with open(xmp_path, "w", encoding="utf-8") as f:
             f.write(xmp_content)
 
@@ -975,9 +992,12 @@ def _write_export_summary(
     total_assets: int,
     json_source: Optional[str],
     top_people_to_print: int,
-) -> None:
-    """Preserve summary shape, ordering and its nonfatal write-error policy."""
+    *,
+    success: bool,
+) -> bool:
+    """Publish complete summary JSON and report any publication failure."""
     summary_file = output_path / "export_summary.json"
+    summary_tmp_path = output_path / ".export_summary.json.tmp"
     summary_data: Dict[str, Any] = {
         "export_timestamp": datetime.now().isoformat(),
         "total_assets": total_assets,
@@ -986,17 +1006,28 @@ def _write_export_summary(
         "unique_people": len(stats.people),
         "people_statistics": stats.people,
         "output_directory": str(output_path.absolute()),
+        "export_status": "completed" if success else "failed",
     }
     if json_source:
         summary_data["json_source"] = json_source
 
     try:
-        with open(summary_file, "w", encoding="utf-8") as f:
+        with open(summary_tmp_path, "w", encoding="utf-8") as f:
             json.dump(summary_data, f, indent=2, ensure_ascii=False)
+        summary_tmp_path.replace(summary_file)
     except IOError as e:
         logger.error(f"❌ Error saving summary file: {e}")
+        return False
+    finally:
+        try:
+            summary_tmp_path.unlink(missing_ok=True)
+        except OSError as e:
+            logger.warning(f"⚠️  Could not remove temporary summary file: {e}")
 
-    logger.info("✅ XMP export completed!")
+    if success:
+        logger.info("✅ XMP export completed!")
+    else:
+        logger.error("❌ XMP export incomplete. See the errors above.")
     logger.info("\n📊 Statistics:")
     logger.info(f"   Total assets processed: {total_assets}")
     logger.info(f"   XMP sidecar files created: {stats.files_created}")
@@ -1009,6 +1040,7 @@ def _write_export_summary(
         logger.info(f"\n👥 People found (top {top_people_to_print}):")
         for person, count in sorted(stats.people.items(), key=lambda item: item[1], reverse=True)[:top_people_to_print]:
             logger.info(f"   {person}: {count} faces")
+    return True
 
 
 def write_xmp_for_assets(
@@ -1031,7 +1063,17 @@ def write_xmp_for_assets(
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
+    # A streamed export can fail after changing sidecars. Invalidate the old
+    # summary before making any changes; if that fails, leave sidecars alone.
+    try:
+        (output_path / "export_summary.json").unlink(missing_ok=True)
+    except OSError as e:
+        logger.error(f"❌ Cannot invalidate the previous export summary: {e}")
+        return False
+
     stats = ExportStatistics()
+    used_paths: Dict[Path, str] = {}
+    write_failed = False
     processed_count = 0
     require_face_regions = export != "all-assets"
 
@@ -1050,8 +1092,10 @@ def write_xmp_for_assets(
                 asset_id = asset_data.get("asset_id") or asset_data.get("id") or f"idx_{processed_count}"
                 original_path = asset_data.get("original_path") or asset_data.get("originalPath") or f"unknown_{asset_id}.jpg"
 
-                if save_xmp_sidecar(original_path, xmp_content, str(output_path)):
+                if save_xmp_sidecar(original_path, xmp_content, str(output_path), used_paths=used_paths):
                     stats.record_write(rendered)
+                else:
+                    write_failed = True
 
             if progress_every and processed_count % progress_every == 0:
                 suffix = f"/{total_assets}" if total_assets else ""
@@ -1064,13 +1108,17 @@ def write_xmp_for_assets(
         logger.warning("No assets found")
         return False
 
-    _write_export_summary(stats, output_path, total_assets or processed_count, json_source, top_people_to_print)
+    success = stats.files_created > 0 and not write_failed
+    summary_written = _write_export_summary(
+        stats, output_path, total_assets or processed_count, json_source, top_people_to_print,
+        success=success,
+    )
 
     if stats.files_created == 0:
         logger.error("\n❌ No XMP files were created (all assets were skipped or writes failed).")
         return False
 
-    return True
+    return success and summary_written
 
 
 # --- Workflows and command-line entry point ---
@@ -1105,15 +1153,19 @@ def export_assets_to_xmp_from_json(
     try:
         with open(json_file_path, "r", encoding="utf-8") as f:
             export_data = json.load(f)
-    except (IOError, json.JSONDecodeError) as e:
+        if not isinstance(export_data, dict) or not isinstance(export_data.get("assets"), list):
+            raise ValueError("Expected a JSON object containing an 'assets' array")
+        processed_assets: List[Dict[str, Any]] = []
+        for asset in export_data["assets"]:
+            if not isinstance(asset, dict):
+                raise ValueError("Each entry in 'assets' must be an object")
+            filtered_asset = filter_asset_for_export(asset, export)
+            if filtered_asset is not None:
+                processed_assets.append(filtered_asset)
+    except (IOError, ValueError, TypeError, AttributeError) as e:
         logger.error(f"❌ Error loading JSON file: {e}")
         return False
 
-    processed_assets: List[Dict[str, Any]] = []
-    for asset in export_data.get("assets") or []:
-        filtered_asset = filter_asset_for_export(asset, export)
-        if filtered_asset is not None:
-            processed_assets.append(filtered_asset)
     if not processed_assets:
         logger.warning("No matching assets found in JSON file")
         return False
@@ -1206,8 +1258,8 @@ Examples:
     return args
 
 
-def main() -> None:
-    """Main function to export asset metadata with two-stage processing."""
+def main() -> int:
+    """Export metadata and return zero only when the requested stages succeed."""
     args = parse_arguments()
     setup_logging(args.debug)
 
@@ -1221,12 +1273,12 @@ def main() -> None:
             logger.info(f"   Check the '{Path(xmp_dir).absolute()}' directory for XMP sidecar files.")
         else:
             logger.error("\n❌ Failed to generate XMP files from JSON")
-        return
+        return 0 if success else 1
 
     config = ConfigLoader()
     config.log_config_summary()
     if not config.validate_immich_config():
-        return
+        return 1
 
     output_config = config.get_output_config()
     immich_config = config.get_immich_config()
@@ -1243,7 +1295,7 @@ def main() -> None:
     with ImmichClient(ApiSettings.from_config(config)) as client:
         if not immich_config["api_key"] and not client.authenticate(immich_config["email"], immich_config["password"]):
             logger.error("❌ Authentication failed. Please check your credentials and server URL.")
-            return
+            return 1
 
         if args.direct_xmp:
             logger.info("\n   Running direct XMP export (single stage): API -> XMP (no intermediate JSON)")
@@ -1256,7 +1308,7 @@ def main() -> None:
                 logger.info(f"   XMP files: {Path(xmp_dir).absolute()}")
             else:
                 logger.error("\n❌ Direct XMP export failed")
-            return
+            return 0 if success else 1
 
         json_file_path = export_assets_to_json(
             client, json_dir, max_assets=args.max_assets, album_id=args.album_id,
@@ -1264,20 +1316,22 @@ def main() -> None:
         )
         if not json_file_path:
             logger.error("❌ Failed to export asset data to JSON")
-            return
+            return 1
 
         if args.stage1_only:
             logger.info("\n🎉 Stage 1 completed successfully!")
             logger.info(f"   JSON file created: {json_file_path}")
             logger.info("   Use this file with --stage2-only --json-file to generate XMP files later.")
-            return
+            return 0
 
         logger.info("\n   Proceeding to Stage 2: Generate XMP files from JSON...")
         if export_assets_to_xmp_from_json(json_file_path, xmp_dir, args.export):
             logger.info("\n🎉 Both stages completed successfully!")
+            return 0
         else:
             logger.error("\n❌ Failed to generate XMP files from JSON")
+            return 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
