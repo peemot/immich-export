@@ -99,6 +99,17 @@ def region_names(root):
     return [node.get(f"{{{NS['mwg']}}}Name") for node in root.findall(REGION_PATH, NS)]
 
 
+def xmp_semantics(content):
+    """Compare metadata exactly while treating RDF bags as unordered collections."""
+    def visit(node):
+        children = [visit(child) for child in node]
+        if node.tag == f"{{{NS['rdf']}}}Bag":
+            children.sort()
+        text = node.text if node.text and node.text.strip() else ""
+        return node.tag, tuple(sorted(node.attrib.items())), text, tuple(children)
+    return visit(ET.fromstring(content))
+
+
 def raw_api_fixture():
     # Hand-authored synthetic API responses, NOT generated from asset()/person()/face().
     # These exercise the expected contract; they are not recordings from an Immich release.
@@ -354,8 +365,8 @@ class ExportPipelineTests(unittest.TestCase):
                     clock.now.return_value = datetime(2026, 7, 22, 12)
                     source = exporter.export_assets_to_json(client, json_output_dir=directory, export=mode)
                     photos = json.loads(Path(source).read_text(encoding="utf-8"))["assets"]
-                    self.assertEqual(expected_ids, [photo["asset_id"] for photo in photos])
-                    portrait = photos[-1]
+                    self.assertEqual(sorted(expected_ids), [photo["asset_id"] for photo in photos])
+                    portrait = next(photo for photo in photos if photo["asset_id"] == "portrait")
                     self.assertEqual("/photos/portrait.jpg", portrait["original_path"])
                     self.assertEqual("portrait.jpg", portrait["file_name"])
                     self.assertEqual((3024, 4032), (portrait["width"], portrait["height"]))
@@ -366,7 +377,7 @@ class ExportPipelineTests(unittest.TestCase):
                     expected_faces = (
                         ["f1"] if mode == "assets-with-known-visible-faces" else ["f1", "f2", "f5", "f3", "f4"]
                     )
-                    self.assertEqual(expected_faces, [f["id"] for p in portrait["people"] for f in p["faces"]])
+                    self.assertCountEqual(expected_faces, [f["id"] for p in portrait["people"] for f in p["faces"]])
 
                     staged, direct = Path(directory) / "staged", Path(directory) / "direct"
                     self.assertTrue(exporter.export_assets_to_xmp_from_json(source, str(staged), mode))
@@ -376,14 +387,17 @@ class ExportPipelineTests(unittest.TestCase):
                             {f"{key}.jpg.xmp" for key in expected_ids}, {p.name for p in output.rglob("*.xmp")}
                         )
                         root = ET.parse(output / "photos/portrait.jpg.xmp").getroot()
-                        self.assertEqual(expected_names, region_names(root))
-                        area = root.find(".//mwg:Area", NS)
+                        self.assertCountEqual(expected_names, region_names(root))
+                        named_region = next(node for node in root.findall(REGION_PATH, NS)
+                                            if node.get(f"{{{NS['mwg']}}}Name") == "Éva")
+                        area = named_region.find("mwg:Area", NS)
                         self.assertEqual((.4, .8, .4, .2), tuple(
                             float(area.get(f"{{{NS['stArea']}}}{key}")) for key in ("x", "y", "w", "h")
                         ))
                     for key in expected_ids:
                         relative = f"photos/{key}.jpg.xmp"
-                        self.assertEqual((staged / relative).read_bytes(), (direct / relative).read_bytes())
+                        self.assertEqual(xmp_semantics((staged / relative).read_bytes()),
+                                         xmp_semantics((direct / relative).read_bytes()))
                     # Both runs must reach page 2 even when known-visible skips all of page 1.
                     search_pages = [c.kwargs["json"]["page"] for c in transport.call_args_list if c.args[0] == "POST"]
                     self.assertEqual([1, 2, 1, 2], search_pages)
@@ -491,7 +505,7 @@ class ExportPipelineTests(unittest.TestCase):
     def test_stage1_write_error_is_reported_and_temp_file_is_removed(self, process):
         process.return_value = iter([asset()])
         with tempfile.TemporaryDirectory() as directory:
-            with patch.object(exporter.json, "dump", side_effect=OSError("disk full")):
+            with patch("builtins.open", side_effect=OSError("disk full")):
                 with self.assertLogs(exporter.logger, level="ERROR"):
                     self.assertIsNone(exporter.export_assets_to_json(make_client(), json_output_dir=directory))
             self.assertEqual([], list(Path(directory).iterdir()))
@@ -879,7 +893,7 @@ class SerializationCompatibilityTests(unittest.TestCase):
                          "Original rich XMP bytes changed (including formatting, order, precision, or metadata)")
         ET.fromstring(content)
 
-    def assert_summary(self, output, selected, written, people, source=None):
+    def assert_summary(self, output, selected, written, people, source=None, *, preserve_people_order=True):
         expected = {
             "export_timestamp": "2026-01-02T03:04:05.123456",
             "total_assets": selected, "total_xmp_files_created": written,
@@ -891,16 +905,27 @@ class SerializationCompatibilityTests(unittest.TestCase):
             expected["json_source"] = str(source)
         content = (output / "export_summary.json").read_bytes()
         self.assertEqual(expected, json.loads(content))
+        if not preserve_people_order:
+            expected["people_statistics"] = json.loads(content)["people_statistics"]
         self.assertEqual(json.dumps(expected, indent=2, ensure_ascii=False).replace("\n", os.linesep).encode("utf-8"),
                          content)
 
-    def test_json_writer_preserves_legacy_record_bytes_and_layout(self):
+    def test_json_writer_preserves_legacy_values_with_sorted_records_and_keys(self):
         data = json.loads(LEGACY_JSON)
         before = copy.deepcopy(data)
+        expected = copy.deepcopy(data)
+        people = expected["assets"][0]["people"]
+        people[:] = [people[2], people[1], people[0], people[3]]
+        faces = people[2]["faces"]
+        faces[:] = [faces[4], faces[0], faces[1], faces[2], faces[3]]
         with tempfile.TemporaryDirectory() as directory, patch.object(exporter, "datetime", FixedClock):
             source = exporter.write_assets_json(iter(data["assets"]), directory, immich_server=data["immich_server"])
             self.assertEqual(EXPORT_JSON_NAME, Path(source).name)
-            self.assertEqual(LEGACY_JSON.replace("\n", os.linesep).encode("utf-8"), Path(source).read_bytes())
+            exported = Path(source).read_text(encoding="utf-8")
+            self.assertEqual(expected, json.loads(exported))
+            self.assertEqual(json.dumps(expected["assets"][0], ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                             exported.splitlines()[5])
+            self.assertEqual(8, len(exported.splitlines()))
             self.assertEqual([Path(source)], list(Path(directory).iterdir()))
         self.assertEqual(before, data)
 
@@ -928,7 +953,10 @@ class SerializationCompatibilityTests(unittest.TestCase):
                     )
                     self.assertEqual(str((work / "json" / EXPORT_JSON_NAME).absolute()), source)
                     data = json.loads(Path(source).read_bytes())
-                    self.assertEqual(selected, [record["asset_id"] for record in data["assets"]])
+                    paths_by_id = {key: f"/photos/{key}.jpg" for key in selected}
+                    paths_by_id.update({"rich": "/photos/2026/\u00c9va & Ada.jpg", "fallback": ""})
+                    self.assertEqual(sorted(selected, key=paths_by_id.__getitem__),
+                                     [record["asset_id"] for record in data["assets"]])
                     self.assertEqual(len(selected), data["total_assets"])
                     self.assertTrue(exporter.export_assets_to_xmp_from_json(source, str(work / "staged"), mode))
                     self.assertTrue(exporter.export_assets_to_xmp(
@@ -944,11 +972,13 @@ class SerializationCompatibilityTests(unittest.TestCase):
                     output = work / kind
                     self.assertEqual(paths | {"export_summary.json"},
                                      {p.relative_to(output).as_posix() for p in output.rglob("*") if p.is_file()})
-                    self.assert_summary(output, len(selected), len(written), counts, source if kind == "staged" else None)
-                    self.assert_rich_xmp((output / special_paths["rich"]).read_bytes(), mode)
+                    self.assert_summary(output, len(selected), len(written), counts, source if kind == "staged" else None,
+                                        preserve_people_order=kind == "direct")
+                    if kind == "direct":
+                        self.assert_rich_xmp((output / special_paths["rich"]).read_bytes(), mode)
                 for path in paths:
                     staged = (work / "staged" / path).read_bytes()
-                    self.assertEqual(staged, (work / "direct" / path).read_bytes())
+                    self.assertEqual(xmp_semantics(staged), xmp_semantics((work / "direct" / path).read_bytes()))
                     ET.fromstring(staged)
                 self.assertEqual({"json", "staged", "direct"}, {p.name for p in work.iterdir()})
 
@@ -1134,17 +1164,14 @@ class CompatibilityBoundaryTests(unittest.TestCase):
             self.assertEqual([previous], list(output.iterdir()))
 
     def test_stage1_serializes_each_asset_before_requesting_the_next(self):
-        serialized = []
-
-        class ObservedAsset(dict):
-            def items(self):
-                serialized.append(self["asset_id"])
-                return super().items()
-
         def records():
-            yield ObservedAsset(asset("first"))
-            self.assertIn("first", serialized, "Stage 1 materialized the stream before serializing it")
-            yield asset("second")
+            # Reuse and mutate one record. Buffering live dictionaries would
+            # incorrectly export the second asset twice instead of snapshots.
+            record = asset("first")
+            yield record
+            record.clear()
+            record.update(asset("second"))
+            yield record
 
         with tempfile.TemporaryDirectory() as directory, api_environment():
             with patch.object(exporter, "process_assets", return_value=records()):
@@ -1375,10 +1402,172 @@ class CompatibilityBoundaryTests(unittest.TestCase):
             self.assertEqual("alias.jpg", ET.parse(output / "alias/raw.jpg.xmp").find(".//xmp:Identifier", NS).text)
 
 
-class ExportOrderingCompatibilityTests(unittest.TestCase):
-    """Equal capture dates must not cause local sorting or change collision order."""
+class DeterministicJsonTests(unittest.TestCase):
+    def test_shuffled_records_nested_arrays_and_object_keys_produce_identical_bytes(self):
+        photos = [
+            asset("z", [person("Zoe", [face(id="z-face"), face(id="a-face")], id="z-person"),
+                        person("Ada", id="a-person")], "/same.jpg"),
+            asset("a", original_path="/same.jpg"),
+            asset("last-id", original_path="/alpha.jpg"),
+            asset("unicode", original_path="/雪.jpg"),
+        ]
+        photos[0]["extension"] = {"coordinates": [3, 1, 2], "flags": [None, False, 0, ""],
+                                  "metadata": {"z": "last", "a": "first"}}
+        before = copy.deepcopy(photos)
 
-    def test_equal_capture_timestamps_preserve_server_order_and_limits(self):
+        def reverse_keys(value):
+            if isinstance(value, dict):
+                return {key: reverse_keys(item) for key, item in reversed(list(value.items()))}
+            if isinstance(value, list):
+                return [reverse_keys(item) for item in value]
+            return value
+
+        shuffled = reverse_keys(list(reversed(photos)))
+        for photo in shuffled:
+            photo["people"].reverse()
+            for who in photo["people"]:
+                who["faces"].reverse()
+        shuffled_before = copy.deepcopy(shuffled)
+        results = []
+        with tempfile.TemporaryDirectory() as directory, patch.object(exporter, "datetime", FixedClock):
+            for number, records in enumerate((photos, shuffled)):
+                output = Path(directory) / str(number)
+                source = exporter.write_assets_json(iter(records), str(output), immich_server="https://example.invalid")
+                self.assertIsNotNone(source)
+                self.assertEqual([Path(source)], list(output.iterdir()))
+                results.append(Path(source).read_bytes())
+        self.assertEqual(results[0], results[1])
+        data = json.loads(results[0])
+        self.assertEqual(["last-id", "a", "z", "unicode"], [photo["asset_id"] for photo in data["assets"]])
+        people = data["assets"][2]["people"]
+        self.assertEqual(["a-person", "z-person"], [who["id"] for who in people])
+        self.assertEqual(["a-face", "z-face"], [item["id"] for item in people[1]["faces"]])
+        self.assertEqual(before[0]["extension"], data["assets"][2]["extension"])
+        self.assertEqual(before, photos)
+        self.assertEqual(shuffled_before, shuffled)
+        lines = results[0].decode("utf-8").splitlines()
+        self.assertEqual(4, len(lines[5:-2]))
+        for line, photo in zip(lines[5:-2], data["assets"]):
+            self.assertEqual(json.dumps(photo, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                             line.removesuffix(","))
+
+    def test_missing_and_duplicate_ids_use_content_tiebreakers_without_dropping_records(self):
+        photos = [
+            {"original_path": "/same.jpg", "asset_id": "same", "marker": "z", "people": [
+                {"name": "Unknown", "faces": [face(boundingBoxX1=200), face(boundingBoxX1=100)]},
+                {"id": "person", "name": "Zoe", "faces": [face(id="same", boundingBoxX1=200),
+                                                             face(id="same", boundingBoxX1=100)]},
+                {"id": "person", "name": "Ada", "faces": None},
+            ]},
+            {"original_path": "/same.jpg", "asset_id": "same", "marker": "a", "people": None},
+            {"originalPath": "/alias.jpg", "id": "alias-id", "people": []},
+            {"file_name": "idless.jpg"},
+            {"file_name": "idless.jpg"},
+        ]
+        reversed_photos = copy.deepcopy(list(reversed(photos)))
+        reversed_photos[-1]["people"].reverse()
+        for who in reversed_photos[-1]["people"]:
+            if isinstance(who.get("faces"), list):
+                who["faces"].reverse()
+        results = []
+        with tempfile.TemporaryDirectory() as directory, patch.object(exporter, "datetime", FixedClock):
+            for records in (photos, reversed_photos):
+                source = exporter.write_assets_json(iter(records), directory, immich_server="https://example.invalid")
+                self.assertIsNotNone(source)
+                results.append(Path(source).read_bytes())
+        self.assertEqual(results[0], results[1])
+        data = json.loads(results[0])
+        self.assertEqual(5, data["total_assets"])
+        self.assertEqual(2, data["assets"].count({"file_name": "idless.jpg"}))
+        self.assertEqual("alias-id", data["assets"][2]["id"])
+        by_marker = {photo["marker"]: photo for photo in data["assets"][3:]}
+        self.assertEqual({"a", "z"}, set(by_marker))
+        self.assertIsNone(by_marker["a"]["people"])
+        self.assertEqual(["Unknown", "Zoe", "Ada"], [who["name"] for who in by_marker["z"]["people"]])
+
+    def test_new_export_time_changes_only_the_timestamp_line(self):
+        results = []
+        with tempfile.TemporaryDirectory() as directory:
+            for now in (datetime(2026, 1, 2, 3, 4, 5), datetime(2026, 2, 3, 4, 5, 6)):
+                with patch.object(exporter, "datetime") as clock:
+                    clock.now.return_value = now
+                    source = exporter.write_assets_json([asset("b"), asset("a")], directory,
+                                                        immich_server="https://example.invalid")
+                self.assertIsNotNone(source)
+                results.append(Path(source).read_text(encoding="utf-8").splitlines())
+        self.assertEqual(len(results[0]), len(results[1]))
+        self.assertEqual([1], [i for i, (left, right) in enumerate(zip(*results)) if left != right])
+        self.assertIn('"export_timestamp"', results[0][1])
+
+    def test_one_metadata_change_affects_only_its_asset_line(self):
+        photos = [asset("c"), asset("a"), asset("b")]
+        results = []
+        with tempfile.TemporaryDirectory() as directory, patch.object(exporter, "datetime", FixedClock):
+            for changed in (False, True):
+                if changed:
+                    photos.reverse()
+                    photos[0]["exifInfo"]["rating"] = 5
+                source = exporter.write_assets_json(iter(photos), directory, immich_server="https://example.invalid")
+                self.assertIsNotNone(source)
+                results.append(Path(source).read_text(encoding="utf-8").splitlines())
+        self.assertEqual(len(results[0]), len(results[1]))
+        self.assertEqual([6], [i for i, (left, right) in enumerate(zip(*results)) if left != right])
+        self.assertEqual("b", json.loads(results[1][6].removesuffix(","))["asset_id"])
+
+    def test_temporary_json_failures_close_files_and_preserve_previous_export(self):
+        original_open = open
+        for phase in ("write", "read", "short-read"):
+            closed = []
+
+            class FailingSpool:
+                def __init__(self, stream):
+                    self.stream = stream
+
+                def __getattr__(self, name):
+                    return getattr(self.stream, name)
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *args):
+                    self.stream.close()
+                    closed.append(True)
+
+                def write(self, content):
+                    if phase == "write":
+                        self.stream.write(content[:10])
+                        raise OSError("injected disk failure")
+                    return self.stream.write(content)
+
+                def read(self, length):
+                    if phase == "read":
+                        raise OSError("injected disk failure")
+                    return self.stream.read(length - 1 if phase == "short-read" else length)
+
+            def failing_open(path, *args, **kwargs):
+                stream = original_open(path, *args, **kwargs)
+                return FailingSpool(stream) if Path(path).name == "assets.jsonl" else stream
+
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory)
+                previous = output / EXPORT_JSON_NAME
+                previous.write_bytes(b"previous export")
+                with (
+                    patch.object(exporter, "datetime", FixedClock),
+                    patch("builtins.open", side_effect=failing_open),
+                    self.assertLogs(exporter.logger, level="ERROR"),
+                ):
+                    self.assertIsNone(exporter.write_assets_json([asset("z"), asset("a")], directory,
+                                                                immich_server="https://example.invalid"))
+                self.assertEqual([True], closed)
+                self.assertEqual(b"previous export", previous.read_bytes())
+                self.assertEqual([previous], list(output.iterdir()))
+
+
+class ExportOrderingCompatibilityTests(unittest.TestCase):
+    """Stage 1 sorts after selection; Stage 2 respects the saved record order."""
+
+    def test_equal_capture_timestamps_sort_json_after_server_order_selection_and_limits(self):
         orders = (("z-photo", "a-photo", "m-photo"), ("m-photo", "a-photo", "z-photo"))
         for mode, order, limit in product(EXPORT_MODES, orders, (None, 1, 2)):
             with self.subTest(mode=mode, order=order, limit=limit), tempfile.TemporaryDirectory() as directory:
@@ -1405,7 +1594,7 @@ class ExportOrderingCompatibilityTests(unittest.TestCase):
                     )
                 self.assertIsNotNone(source)
                 exported = json.loads(Path(source).read_bytes())
-                expected_order = list(order if limit is None else order[:limit])
+                expected_order = sorted(order if limit is None else order[:limit])
                 self.assertEqual(expected_order, [item["asset_id"] for item in exported["assets"]])
                 self.assertEqual(len(expected_order), exported["total_assets"])
                 self.assertEqual([1, 2] if limit is None else [1],
