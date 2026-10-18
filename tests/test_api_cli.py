@@ -248,7 +248,7 @@ class CommandLineTests(unittest.TestCase):
             patch.object(exporter, "export_assets_to_xmp") as direct,
             self.assertLogs(exporter.logger, level="ERROR"),
         ):
-            exporter.main()
+            self.assertEqual(1, exporter.main())
         stage1.assert_not_called()
         direct.assert_not_called()
         create.return_value.close.assert_called_once_with()
@@ -284,7 +284,7 @@ class CommandLineTests(unittest.TestCase):
                     patch.object(exporter, "export_assets_to_xmp_from_json", return_value=True) as stage2,
                     patch.object(exporter, "export_assets_to_xmp", return_value=True) as direct,
                 ):
-                    exporter.main()
+                    self.assertEqual(0, exporter.main())
                 client = (direct if mode == ["--direct-xmp"] else stage1).call_args.args[0]
                 self.assertIs(session, client.session)
                 self.assertEqual(api_key, client.settings.api_key)
@@ -309,6 +309,29 @@ class CommandLineTests(unittest.TestCase):
                     else:
                         stage2.assert_called_once_with("interim.json", "cli-xmp", "assets-with-faces")
                 session.close.assert_called_once_with()
+
+    def test_failed_stages_return_nonzero_in_every_processing_mode(self):
+        cases = (
+            ([], None, True),
+            (["--stage1-only"], None, True),
+            ([], "interim.json", False),
+            (["--direct-xmp"], "interim.json", False),
+            (["--stage2-only", "--json-file", "interim.json", "--xmp-dir", "xmp"], "interim.json", False),
+        )
+        for arguments, json_result, xmp_result in cases:
+            with (
+                self.subTest(arguments=arguments, json_result=json_result),
+                patch.object(sys, "argv", ["export_xmp.py", *arguments]),
+                patch.object(exporter, "setup_logging"),
+                patch.object(exporter, "ConfigLoader", return_value=config_stub()),
+                patch.object(exporter, "create_http_session"),
+                patch.object(exporter, "export_assets_to_json", return_value=json_result),
+                patch.object(exporter, "export_assets_to_xmp_from_json", return_value=xmp_result),
+                patch.object(exporter, "export_assets_to_xmp", return_value=xmp_result),
+                self.assertLogs(exporter.logger, level="INFO") as messages,
+            ):
+                self.assertEqual(1, exporter.main())
+            self.assertFalse(any("successfully" in message for message in messages.output))
 
 
 class CompatibilityCommandLineTests(unittest.TestCase):
@@ -369,14 +392,16 @@ with patch('requests.sessions.Session.request', side_effect=AssertionError('Unex
                 self.assertIn("usage:", result.stderr)
                 self.assertFalse(list(self.root.rglob("*.xmp")))
 
-    def test_invalid_configuration_exits_zero_without_network(self):
+    def test_invalid_configuration_exits_nonzero_without_network(self):
         result = self.run_entrypoint()
-        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual(1, result.returncode, result.stderr)
         self.assertIn("Configuration error:", result.stderr)
         self.assertEqual(["config.json"], [path.name for path in self.root.iterdir()])
 
-    def test_handled_stage2_failures_exit_zero_in_real_entrypoint(self):
+    def test_handled_stage2_failures_exit_nonzero_in_real_entrypoint(self):
         cases = (("missing", None), ("invalid", "{invalid"), ("empty", '{"assets": []}'),
+                 ("wrong-root", "[]"), ("missing-assets", "{}"), ("wrong-assets", '{"assets": {}}'),
+                 ("wrong-asset", '{"assets": [null]}'), ("wrong-people", '{"assets": [{"people": [null]}]}'),
                  ("unwritable-regions", json.dumps({"assets": [{"asset_id": "zero-area", "width": 100, "height": 100,
                      "people": [{"name": "Ada", "faces": [{"boundingBoxX1": 0, "boundingBoxY1": 0,
                          "boundingBoxX2": 0, "boundingBoxY2": 10}]}]}]})))
@@ -389,9 +414,41 @@ with patch('requests.sessions.Session.request', side_effect=AssertionError('Unex
                 result = self.run_entrypoint(
                     "--stage2-only", "--json-file", str(source), "--xmp-dir", str(output), "--export", "assets-with-faces",
                 )
-                self.assertEqual(0, result.returncode, result.stderr)
+                self.assertEqual(1, result.returncode, result.stderr)
                 self.assertIn("Failed to generate XMP files from JSON", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
                 self.assertFalse(list(output.rglob("*.xmp")))
+
+    def test_partial_sidecar_failure_exits_nonzero_and_keeps_successful_file(self):
+        source = self.root / "source.json"
+        source.write_text(json.dumps({"assets": [
+            {"original_path": "/blocked.jpg", "people": []},
+            {"original_path": "/written.jpg", "people": []},
+        ]}), encoding="utf-8")
+        output = self.root / "xmp"
+        (output / "blocked.jpg.xmp").mkdir(parents=True)
+        result = self.run_entrypoint("--stage2-only", "--json-file", str(source), "--xmp-dir", str(output))
+        self.assertEqual(1, result.returncode, result.stderr)
+        self.assertNotIn("completed!", result.stderr)
+        self.assertNotIn("successfully", result.stderr)
+        self.assertTrue((output / "written.jpg.xmp").is_file())
+        summary = json.loads((output / "export_summary.json").read_text(encoding="utf-8"))
+        self.assertEqual("failed", summary["export_status"])
+        self.assertEqual(1, summary["total_xmp_files_created"])
+
+    def test_path_collision_exits_nonzero_without_overwriting_first_asset(self):
+        source = self.root / "source.json"
+        source.write_text(json.dumps({"assets": [
+            {"original_path": "/same.jpg", "file_name": "first.jpg", "people": []},
+            {"original_path": "same.jpg", "file_name": "last.jpg", "people": []},
+        ]}), encoding="utf-8")
+        output = self.root / "xmp"
+        result = self.run_entrypoint("--stage2-only", "--json-file", str(source), "--xmp-dir", str(output))
+        self.assertEqual(1, result.returncode, result.stderr)
+        self.assertIn("Path collision", result.stderr)
+        content = (output / "same.jpg.xmp").read_text(encoding="utf-8")
+        self.assertIn("<xmp:Identifier>first.jpg</xmp:Identifier>", content)
+        self.assertNotIn("last.jpg", content)
 
     def test_unhandled_output_directory_error_exits_nonzero(self):
         source = self.root / "source.json"
