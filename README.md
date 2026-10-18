@@ -187,6 +187,8 @@ json_exports/
 
 The intermediate file has `export_timestamp`, `immich_server`, `total_assets`, and an `assets` array. Each asset contains its ID, original path, file name, dimensions, `exifInfo`, and `people`. Each person's `faces` contain bounding boxes and, when available, the dimensions of the face-analysis image. For rotated photos, those dimensions can differ from the raw EXIF image dimensions. Stage 2 reads this file locally; it does not need an Immich connection or credentials when `--xmp-dir` is provided.
 
+JSON ordering is automatic: assets are sorted by `original_path`, then `asset_id`; people and faces are sorted by their IDs.
+
 ### XMP sidecars, Stage 2 or direct mode
 
 The `xmp_sidecars` directory mirrors the original Immich asset paths.
