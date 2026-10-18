@@ -570,8 +570,9 @@ class ExportPipelineTests(unittest.TestCase):
                   asset("second", [person("Ada")]), asset("failed", [person("Bea")])]
         with tempfile.TemporaryDirectory() as directory:
             with patch.object(exporter, "save_xmp_sidecar", side_effect=[True, True, False]):
-                self.assertTrue(exporter.write_xmp_for_assets(iter(photos), directory))
+                self.assertFalse(exporter.write_xmp_for_assets(iter(photos), directory))
             summary = json.loads((Path(directory) / "export_summary.json").read_text(encoding="utf-8"))
+            self.assertEqual("failed", summary["export_status"])
             self.assertEqual(3, summary["total_assets"])
             self.assertEqual(2, summary["total_xmp_files_created"])
             self.assertEqual(3, summary["total_faces_processed"])
@@ -884,6 +885,7 @@ class SerializationCompatibilityTests(unittest.TestCase):
             "total_assets": selected, "total_xmp_files_created": written,
             "total_faces_processed": sum(people.values()), "unique_people": len(people),
             "people_statistics": people, "output_directory": str(output.absolute()),
+            "export_status": "completed",
         }
         if source is not None:
             expected["json_source"] = str(source)
@@ -1160,7 +1162,7 @@ class CompatibilityBoundaryTests(unittest.TestCase):
             self.assertEqual(["unknown"], [item["asset_id"] for item in data["assets"]])
             self.assertEqual([Path(second)], list(Path(directory).iterdir()))
 
-    def test_late_direct_failure_leaves_partial_sidecars_and_existing_summary_untouched(self):
+    def test_late_direct_failure_leaves_partial_sidecars_but_removes_stale_summary(self):
         api = SyntheticAPI()
         api.page_errors["2"] = exporter.requests.exceptions.Timeout("second page unavailable")
         with tempfile.TemporaryDirectory() as directory:
@@ -1171,9 +1173,9 @@ class CompatibilityBoundaryTests(unittest.TestCase):
                 self.assertFalse(exporter.export_assets_to_xmp(client, output_dir=directory))
             self.assertEqual({"unknown.jpg.xmp", "empty.jpg.xmp", "hidden.jpg.xmp"},
                              {path.name for path in output.rglob("*.xmp")})
-            self.assertEqual(b"previous summary", previous_summary.read_bytes())
+            self.assertFalse(previous_summary.exists())
 
-    def test_one_actual_sidecar_open_failure_still_allows_success_and_counts_only_written_regions(self):
+    def test_one_actual_sidecar_open_failure_fails_export_and_counts_only_written_regions(self):
         photos = [asset("failed", [person("Bea")]), asset("written", [person("Ada")])]
         original_open = open
         with tempfile.TemporaryDirectory() as directory:
@@ -1182,23 +1184,26 @@ class CompatibilityBoundaryTests(unittest.TestCase):
                     raise OSError("sidecar is not writable")
                 return original_open(path, *args, **kwargs)
             with patch("builtins.open", side_effect=failing_open), self.assertLogs(exporter.logger, level="ERROR"):
-                self.assertTrue(exporter.write_xmp_for_assets(photos, directory))
+                self.assertFalse(exporter.write_xmp_for_assets(photos, directory))
             summary = json.loads((Path(directory) / "export_summary.json").read_bytes())
+            self.assertEqual("failed", summary["export_status"])
             self.assertEqual((2, 1, 1), tuple(summary[key] for key in
                              ("total_assets", "total_xmp_files_created", "total_faces_processed")))
             self.assertEqual({"Ada": 1}, summary["people_statistics"])
             self.assertEqual(["written.jpg.xmp"], [path.name for path in Path(directory).rglob("*.xmp")])
 
-    def test_summary_open_failure_does_not_turn_written_sidecars_into_failure(self):
+    def test_summary_open_failure_fails_export_without_a_success_message(self):
         original_open = open
         with tempfile.TemporaryDirectory() as directory:
             def failing_open(path, *args, **kwargs):
-                if Path(path).name == "export_summary.json":
+                if Path(path).name == ".export_summary.json.tmp":
                     raise OSError("summary is not writable")
                 return original_open(path, *args, **kwargs)
-            with patch("builtins.open", side_effect=failing_open), self.assertLogs(exporter.logger, level="ERROR"):
-                self.assertTrue(exporter.write_xmp_for_assets([asset()], directory))
+            with patch("builtins.open", side_effect=failing_open), self.assertLogs(exporter.logger, level="INFO") as messages:
+                self.assertFalse(exporter.write_xmp_for_assets([asset()], directory))
+            self.assertFalse(any("completed!" in message for message in messages.output))
             self.assertFalse((Path(directory) / "export_summary.json").exists())
+            self.assertFalse((Path(directory) / ".export_summary.json.tmp").exists())
             self.assertEqual(1, len(list(Path(directory).rglob("*.xmp"))))
 
     def test_output_directory_creation_errors_propagate(self):
@@ -1211,7 +1216,48 @@ class CompatibilityBoundaryTests(unittest.TestCase):
                 exporter.write_xmp_for_assets([asset()], str(output))
             self.assertEqual(b"existing file", output.read_bytes())
 
-    def test_colliding_paths_keep_last_sidecar_but_summary_counts_each_successful_write(self):
+    def test_summary_write_and_publish_failures_remove_stale_and_partial_summaries(self):
+        def fail_during_dump(data, stream, **kwargs):
+            stream.write('{"partial":')
+            raise OSError("disk full")
+
+        for phase in ("write", "publish"):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory)
+                summary = output / "export_summary.json"
+                summary.write_bytes(b"previous summary")
+                failure = (patch.object(exporter.json, "dump", side_effect=fail_during_dump) if phase == "write"
+                           else patch.object(Path, "replace", side_effect=OSError("publish failed")))
+                with failure, self.assertLogs(exporter.logger, level="INFO") as messages:
+                    self.assertFalse(exporter.write_xmp_for_assets([asset()], directory))
+                self.assertFalse(summary.exists())
+                self.assertFalse((output / ".export_summary.json.tmp").exists())
+                self.assertEqual(1, len(list(output.rglob("*.xmp"))))
+                self.assertFalse(any("completed!" in message for message in messages.output))
+
+    def test_failed_summary_invalidation_leaves_sidecars_and_asset_stream_untouched(self):
+        consumed = []
+
+        def records():
+            consumed.append(True)
+            yield asset("photo", [person("Ada")])
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            summary = output / "export_summary.json"
+            summary.write_bytes(b"previous summary")
+            sidecar = output / "photos/2026/photo.jpg.xmp"
+            sidecar.parent.mkdir(parents=True)
+            sidecar.write_bytes(b"previous sidecar")
+            with patch.object(Path, "unlink", side_effect=PermissionError("summary locked")), self.assertLogs(
+                exporter.logger, level="ERROR",
+            ):
+                self.assertFalse(exporter.write_xmp_for_assets(records(), directory))
+            self.assertEqual([], consumed)
+            self.assertEqual(b"previous summary", summary.read_bytes())
+            self.assertEqual(b"previous sidecar", sidecar.read_bytes())
+
+    def test_colliding_paths_keep_first_sidecar_and_count_its_regions_once(self):
         photos = [asset("first", [person("Ada")], "/photos/same.jpg"),
                   asset("last", [person("Bea")], "/photos/../same.jpg")]
         with tempfile.TemporaryDirectory() as directory:
@@ -1221,13 +1267,70 @@ class CompatibilityBoundaryTests(unittest.TestCase):
             target.write_bytes(b"pre-existing sidecar")
             unrelated = output / "unrelated.xmp"
             unrelated.write_bytes(b"must not be removed")
-            self.assertTrue(exporter.write_xmp_for_assets(photos, directory))
-            self.assertEqual(["Bea"], region_names(ET.parse(target).getroot()))
-            self.assertEqual("last.jpg", ET.parse(target).find(".//xmp:Identifier", NS).text)
+            with self.assertLogs(exporter.logger, level="ERROR") as messages:
+                self.assertFalse(exporter.write_xmp_for_assets(photos, directory))
+            self.assertTrue(any("Path collision" in message for message in messages.output))
+            self.assertEqual(["Ada"], region_names(ET.parse(target).getroot()))
+            self.assertEqual("first.jpg", ET.parse(target).find(".//xmp:Identifier", NS).text)
             self.assertEqual(b"must not be removed", unrelated.read_bytes())
             summary = json.loads((output / "export_summary.json").read_bytes())
-            self.assertEqual(2, summary["total_xmp_files_created"])
-            self.assertEqual({"Ada": 1, "Bea": 1}, summary["people_statistics"])
+            self.assertEqual("failed", summary["export_status"])
+            self.assertEqual(2, summary["total_assets"])
+            self.assertEqual(1, summary["total_xmp_files_created"])
+            self.assertEqual(1, summary["total_faces_processed"])
+            self.assertEqual({"Ada": 1}, summary["people_statistics"])
+
+    def test_collisions_through_symlinks_keep_first_asset_and_continue_with_other_paths(self):
+        photos = [asset("first", [person("Ada")], "/photos/same.jpg"),
+                  asset("collision", [person("Bea")], "/alias/same.jpg"),
+                  asset("other", [person("Cara")], "/photos/other.jpg")]
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            (output / "photos").mkdir()
+            try:
+                (output / "alias").symlink_to(output / "photos", target_is_directory=True)
+            except (OSError, NotImplementedError):
+                self.skipTest("Directory symlinks are unavailable")
+            with self.assertLogs(exporter.logger, level="ERROR"):
+                self.assertFalse(exporter.write_xmp_for_assets(photos, directory))
+            self.assertEqual(["Ada"], region_names(ET.parse(output / "photos/same.jpg.xmp").getroot()))
+            self.assertEqual(["Cara"], region_names(ET.parse(output / "photos/other.jpg.xmp").getroot()))
+            summary = json.loads((output / "export_summary.json").read_bytes())
+            self.assertEqual((3, 2, 2), tuple(summary[key] for key in
+                             ("total_assets", "total_xmp_files_created", "total_faces_processed")))
+            self.assertEqual({"Ada": 1, "Cara": 1}, summary["people_statistics"])
+
+    def test_failed_write_still_reserves_its_destination_against_collisions(self):
+        photos = [asset("first", [person("Ada")], "/photos/same.jpg"),
+                  asset("collision", [person("Bea")], "/photos/same.jpg"), asset("other")]
+        original_open = open
+        attempts = []
+
+        def failing_open(path, *args, **kwargs):
+            if Path(path).name == "same.jpg.xmp":
+                attempts.append(path)
+                raise OSError("sidecar is not writable")
+            return original_open(path, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as directory:
+            with patch("builtins.open", side_effect=failing_open), self.assertLogs(exporter.logger, level="ERROR") as messages:
+                self.assertFalse(exporter.write_xmp_for_assets(photos, directory))
+            self.assertEqual(1, len(attempts))
+            self.assertTrue(any("Path collision" in message for message in messages.output))
+            summary = json.loads((Path(directory) / "export_summary.json").read_bytes())
+            self.assertEqual(1, summary["total_xmp_files_created"])
+            self.assertEqual({}, summary["people_statistics"])
+
+    def test_later_run_can_replace_previously_exported_sidecar_and_summary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            for name in ("Ada", "Bea"):
+                self.assertTrue(exporter.write_xmp_for_assets([asset("photo", [person(name)])], directory))
+                self.assertEqual([name], region_names(ET.parse(output / "photos/2026/photo.jpg.xmp").getroot()))
+                summary = json.loads((output / "export_summary.json").read_bytes())
+                self.assertEqual("completed", summary["export_status"])
+                self.assertEqual(1, summary["total_xmp_files_created"])
+                self.assertEqual({name: 1}, summary["people_statistics"])
 
     def test_windows_style_paths_keep_current_host_specific_interpretation(self):
         cases = [("C:/photos/archive/photo.jpg", "photos/archive/photo.jpg.xmp"),
@@ -1273,7 +1376,7 @@ class CompatibilityBoundaryTests(unittest.TestCase):
 
 
 class ExportOrderingCompatibilityTests(unittest.TestCase):
-    """Equal capture dates must not cause local sorting or change last-write wins."""
+    """Equal capture dates must not cause local sorting or change collision order."""
 
     def test_equal_capture_timestamps_preserve_server_order_and_limits(self):
         orders = (("z-photo", "a-photo", "m-photo"), ("m-photo", "a-photo", "z-photo"))
@@ -1319,17 +1422,16 @@ class ExportOrderingCompatibilityTests(unittest.TestCase):
                 source.write_text(json.dumps({"total_assets": 2, "assets": ordered}), encoding="utf-8")
                 before = source.read_bytes()
                 output = Path(directory) / "xmp"
-                with patch.object(exporter, "datetime", FixedClock):
-                    self.assertTrue(exporter.export_assets_to_xmp_from_json(str(source), str(output), mode))
+                with patch.object(exporter, "datetime", FixedClock), self.assertLogs(exporter.logger, level="ERROR"):
+                    self.assertFalse(exporter.export_assets_to_xmp_from_json(str(source), str(output), mode))
                 root = ET.parse(output / "photos/tied.jpg.xmp").getroot()
-                expected_name = ordered[-1]["people"][0]["name"]
+                expected_name = ordered[0]["people"][0]["name"]
                 self.assertEqual([expected_name], region_names(root))
-                self.assertEqual(ordered[-1]["file_name"], root.find(".//xmp:Identifier", NS).text)
+                self.assertEqual(ordered[0]["file_name"], root.find(".//xmp:Identifier", NS).text)
                 summary = json.loads((output / "export_summary.json").read_bytes())
-                self.assertEqual([item["people"][0]["name"] for item in ordered],
-                                 list(summary["people_statistics"]))
-                self.assertEqual({"Zoe": 1, "Ada": 1}, summary["people_statistics"])
-                self.assertEqual((2, 2, 2), tuple(summary[key] for key in
+                self.assertEqual("failed", summary["export_status"])
+                self.assertEqual({expected_name: 1}, summary["people_statistics"])
+                self.assertEqual((2, 1, 1), tuple(summary[key] for key in
                                  ("total_assets", "total_xmp_files_created", "total_faces_processed")))
                 self.assertEqual({"photos/tied.jpg.xmp", "export_summary.json"},
                                  {path.relative_to(output).as_posix() for path in output.rglob("*") if path.is_file()})
@@ -1399,9 +1501,7 @@ class WorkerFailureCompatibilityTests(unittest.TestCase):
                     self.assertTrue(errors.called)
                     consumed = self.PAGE_IDS[:self.PAGE_IDS.index(failed_id)]
                     expected = {f"photos/{value}.jpg.xmp" for value in consumed}
-                    if has_previous:
-                        expected.add("export_summary.json")
-                        self.assertEqual(b"previous summary", summary.read_bytes())
+                    self.assertFalse(summary.exists())
                     self.assertEqual(expected, {path.relative_to(output).as_posix()
                                                 for path in output.rglob("*") if path.is_file()})
                 self.assertEqual([1], [payload["page"] for payload in api.search_payloads()])
