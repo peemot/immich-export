@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Export Immich metadata and face regions to JSON and XMP, in one file.
 
-Configuration is loaded at the CLI boundary. ImmichClient owns HTTP and the
-search protocol; export records are ordinary dictionaries shared by the
-API and offline JSON paths. Selection and XMP rendering do not perform I/O.
+Configuration is loaded at the CLI boundary. Independent search implementations
+share ImmichClient's HTTP and face processing; export records are ordinary
+dictionaries shared by the API and offline JSON paths. Selection and XMP
+rendering do not perform I/O.
 JSON exports use deterministic ordering; incomplete exports report failure.
 """
 
@@ -18,7 +19,7 @@ from datetime import datetime
 from pathlib import Path
 from queue import Queue
 from tempfile import TemporaryDirectory
-from typing import Any, Dict, Generator, Iterable, Iterator, List, Mapping, Optional, Tuple, TypedDict
+from typing import Any, Callable, Dict, Generator, Iterable, Iterator, List, Mapping, Optional, Tuple, TypedDict
 from xml.sax.saxutils import escape as _xml_escape
 
 import requests
@@ -68,14 +69,25 @@ class ApiSettings:
     request_timeout: int = 30
     retry_attempts: int = 3
     face_request_workers: int = 8
+    search_api: str = "legacy"
+
+    def __post_init__(self) -> None:
+        if self.search_api not in ("legacy", "structured"):
+            raise ValueError(
+                "Search API must be 'legacy' or 'structured'; set settings.search_api, "
+                "IMMICH_SEARCH_API, or --search-api."
+            )
 
     @classmethod
-    def from_config(cls, config: "ConfigLoader") -> "ApiSettings":
+    def from_config(cls, config: "ConfigLoader", *, search_api: Optional[str] = None) -> "ApiSettings":
         connection = config.get_immich_config()
+        settings = dict(config.get_settings_config())
+        if search_api is not None:
+            settings["search_api"] = search_api
         return cls(
             base_url=connection["base_url"],
             api_key=connection["api_key"],
-            **config.get_settings_config(),
+            **settings,
         )
 
 
@@ -163,6 +175,7 @@ class ConfigLoader:
             "IMMICH_REQUEST_TIMEOUT": ["settings", "request_timeout"],
             "IMMICH_RETRY_ATTEMPTS": ["settings", "retry_attempts"],
             "IMMICH_FACE_REQUEST_WORKERS": ["settings", "face_request_workers"],
+            "IMMICH_SEARCH_API": ["settings", "search_api"],
             "OUTPUT_XMP_DIR": ["output", "xmp_export_dir"],
             "OUTPUT_JSON_DIR": ["output", "json_export_dir"],
         }
@@ -230,6 +243,7 @@ class ConfigLoader:
             "request_timeout": self.get("settings.request_timeout", 30),
             "retry_attempts": self.get("settings.retry_attempts", 3),
             "face_request_workers": face_request_workers,
+            "search_api": self.get("settings.search_api", "legacy"),
         }
 
     def validate_immich_config(self) -> bool:
@@ -283,12 +297,167 @@ def create_http_session(retries: int) -> requests.Session:
     return session
 
 
-class ImmichClient:
-    """Own the connection and isolate the current Immich API contract.
+class LegacySearch:
+    """Own the flat search contract; keep pagination local to each traversal."""
 
-    Request shape, response parsing, pagination and face hydration stay here.
-    A later structured-filter/cursor migration must not change the dictionaries
-    consumed by selection or the file writers. No future API path is enabled.
+    name = "legacy"
+    compatibility_hint = (
+        "Legacy search fields are scheduled for removal in Immich v4; "
+        "select --search-api structured on Immich 3.2.0 or newer."
+    )
+
+    @staticmethod
+    def _payload(
+        page: int,
+        album_id: Optional[str],
+        library_id: Optional[str],
+        with_people: bool,
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {"page": page, "size": 1000, "withExif": True}
+        if with_people:
+            payload["withPeople"] = True
+        if album_id:
+            payload["albumIds"] = [album_id]
+        if library_id:
+            payload["libraryId"] = library_id
+        return payload
+
+    @staticmethod
+    def _parse_page(search_data: Any, page: int) -> Tuple[List[Dict[str, Any]], Optional[Any]]:
+        """Accept the existing nested and flat search response envelopes."""
+        assets_data = search_data.get("assets") if isinstance(search_data, dict) else None
+        assets_data = assets_data if assets_data is not None else search_data
+        if not isinstance(assets_data, dict):
+            raise ValueError(f"❌ Error: Unexpected search response shape on page {page} (expected dict)")
+        if "nextCursor" in assets_data and (
+            "nextPage" not in assets_data or assets_data["nextCursor"] is not None
+        ):
+            raise RuntimeError(
+                "The server returned cursor pagination for legacy search. "
+                "Select --search-api structured; legacy search fields are scheduled for removal in Immich v4."
+            )
+        items = assets_data.get("items") or []
+        if not isinstance(items, list):
+            raise ValueError(f"❌ Error: Unexpected 'items' type on page {page} (expected list)")
+        return items, assets_data.get("nextPage")
+
+    def iter_pages(
+        self,
+        search: Callable[[Dict[str, Any]], Any],
+        *,
+        album_id: Optional[str] = None,
+        library_id: Optional[str] = None,
+        with_people: bool = False,
+    ) -> Generator[List[Dict[str, Any]], None, None]:
+        page = 1
+        while True:
+            payload = self._payload(page, album_id, library_id, with_people)
+            items, next_page = self._parse_page(search(payload), page)
+            if not items:
+                return
+            yield items
+            if not next_page:
+                return
+            try:
+                page = int(next_page)
+            except (TypeError, ValueError):
+                page += 1
+
+
+class StructuredSearch:
+    """Own structured filters, cursor pagination and legacy selection parity."""
+
+    name = "structured"
+    compatibility_hint = (
+        "Structured search requires Immich 3.2.0 or newer; "
+        "select --search-api legacy for an older server."
+    )
+
+    @staticmethod
+    def _payload(
+        cursor: Optional[str],
+        album_id: Optional[str],
+        library_id: Optional[str],
+        with_people: bool,
+    ) -> Dict[str, Any]:
+        """Preserve legacy defaults using supported structured search fields.
+
+        Structured search includes trash unless explicitly filtered. Both APIs
+        otherwise share album/partner access rules, locked-asset policy and
+        default fileCreatedAt/id descending order (Immich PR #30179).
+        """
+        filters: Dict[str, Any] = {"trashedAt": {"eq": None}}
+        if album_id:
+            filters["albumIds"] = {"all": [album_id]}
+        if library_id:
+            filters["libraryId"] = {"eq": library_id}
+        payload: Dict[str, Any] = {"filter": filters, "size": 1000, "withExif": True}
+        if with_people:
+            payload["withPeople"] = True
+        if cursor is not None:
+            payload["cursor"] = cursor
+        return payload
+
+    @staticmethod
+    def _parse_page(
+        search_data: Any, page: int,
+    ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+        """Reject incompatible pagination before a page reaches face processing."""
+        assets_data = search_data.get("assets") if isinstance(search_data, dict) else None
+        assets_data = assets_data if assets_data is not None else search_data
+        if not isinstance(assets_data, dict):
+            raise ValueError(f"Unexpected structured search response on page {page} (expected dict)")
+        if assets_data.get("nextPage") is not None:
+            raise RuntimeError(
+                "The server returned incompatible pagination for structured search: "
+                "nextPage must be null or absent. Check the server's structured search support."
+            )
+        if "nextCursor" not in assets_data:
+            raise RuntimeError(
+                "The server did not return structured search pagination (nextCursor). "
+                "Structured search requires Immich 3.2.0 or newer. "
+                "For an older server, select --search-api legacy."
+            )
+        items = assets_data.get("items")
+        if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
+            raise ValueError(f"Unexpected structured search items on page {page} (expected a list of objects)")
+        next_cursor = assets_data["nextCursor"]
+        if next_cursor is not None and (not isinstance(next_cursor, str) or not next_cursor):
+            raise ValueError(f"Invalid nextCursor on page {page} (expected a non-empty string or null)")
+        return items, next_cursor
+
+    def iter_pages(
+        self,
+        search: Callable[[Dict[str, Any]], Any],
+        *,
+        album_id: Optional[str] = None,
+        library_id: Optional[str] = None,
+        with_people: bool = False,
+    ) -> Generator[List[Dict[str, Any]], None, None]:
+        page = 1
+        cursor: Optional[str] = None
+        seen_cursors: set[str] = set()
+        while True:
+            payload = self._payload(cursor, album_id, library_id, with_people)
+            items, next_cursor = self._parse_page(search(payload), page)
+            if next_cursor is not None:
+                if next_cursor in seen_cursors:
+                    raise ValueError(f"Repeated nextCursor on page {page}; refusing to repeat search results")
+                seen_cursors.add(next_cursor)
+            # Legacy withExif uses an inner join; structured uses a left join.
+            # Exclude missing EXIF rows before face retrieval and asset counting.
+            yield [item for item in items if item.get("exifInfo") is not None]
+            if next_cursor is None:
+                return
+            cursor = next_cursor
+            page += 1
+
+
+class ImmichClient:
+    """Own shared HTTP, authentication, face hydration and export projection.
+
+    The search implementation is selected once. Each traversal supplies metadata
+    pages through the same interface without changing modes after a failure.
     """
 
     def __init__(
@@ -300,6 +469,9 @@ class ImmichClient:
     ):
         self.settings = settings
         self.access_token = access_token
+        self._search: LegacySearch | StructuredSearch = (
+            LegacySearch() if settings.search_api == "legacy" else StructuredSearch()
+        )
         # An injected session belongs to the caller; normal CLI sessions are owned.
         self._owns_session = session is None
         self.session = create_http_session(settings.retry_attempts) if session is None else session
@@ -349,34 +521,18 @@ class ImmichClient:
             logger.error(f"Failed to parse authentication response: {e}")
         return None
 
-    @staticmethod
-    def _search_payload(
-        page: int,
-        album_id: Optional[str],
-        library_id: Optional[str],
-        known_visible_only: bool,
-    ) -> Dict[str, Any]:
-        """Preserve the page-based request, without mixing in new fields."""
-        payload: Dict[str, Any] = {"page": page, "size": 1000, "withExif": True}
-        if known_visible_only:
-            payload["withPeople"] = True
-        if album_id:
-            payload["albumIds"] = [album_id]
-        if library_id:
-            payload["libraryId"] = library_id
-        return payload
-
-    @staticmethod
-    def _search_page(search_data: Any, page: int) -> Tuple[List[Dict[str, Any]], Optional[Any]]:
-        """Accept the existing nested and flat search response envelopes."""
-        assets_data = search_data.get("assets") if isinstance(search_data, dict) else None
-        assets_data = assets_data if assets_data is not None else search_data
-        if not isinstance(assets_data, dict):
-            raise ValueError(f"❌ Error: Unexpected search response shape on page {page} (expected dict)")
-        items = assets_data.get("items") or []
-        if not isinstance(items, list):
-            raise ValueError(f"❌ Error: Unexpected 'items' type on page {page} (expected list)")
-        return items, assets_data.get("nextPage")
+    def _search_metadata(self, payload: Dict[str, Any]) -> Any:
+        """Use shared transport and attach the selected protocol's error guidance."""
+        try:
+            return self.request("POST", "/search/metadata", json=payload).json()
+        except requests.exceptions.HTTPError as error:
+            status = error.response.status_code if error.response is not None else None
+            if status in (400, 404, 405, 410, 422):
+                raise RuntimeError(
+                    f"Immich rejected {self._search.name} search (HTTP {status}). "
+                    f"{self._search.compatibility_hint} Also check the album/library IDs and server URL."
+                ) from error
+            raise
 
     @staticmethod
     def _has_known_visible_person(item: Dict[str, Any]) -> bool:
@@ -467,30 +623,23 @@ class ImmichClient:
         library_id: Optional[str] = None,
         known_visible_only: bool = False,
     ) -> Generator[ExportAsset, None, None]:
-        """Yield hydrated records in search order; pagination is private here."""
-        page = 1
-        while True:
-            try:
-                payload = self._search_payload(page, album_id, library_id, known_visible_only)
-                items, next_page = self._search_page(
-                    self.request("POST", "/search/metadata", json=payload).json(), page,
-                )
-                if not items:
-                    return
+        """Hydrate metadata pages without knowing their search or pagination format."""
+        pages = self._search.iter_pages(
+            self._search_metadata, album_id=album_id, library_id=library_id,
+            with_people=known_visible_only,
+        )
+        try:
+            for page_number, items in enumerate(pages, 1):
                 if known_visible_only:
                     items = [item for item in items if self._has_known_visible_person(item)]
                 for item, people in zip(items, self._page_people(items)):
                     yield self._export_record(item, people)
-                logger.debug(f"Finished processing page {page}")
-                if not next_page:
-                    return
-                try:
-                    page = int(next_page)
-                except (TypeError, ValueError):
-                    page += 1
-            except Exception as e:
-                logger.error(f"❌ Error collecting assets on page {page}: {e}")
-                raise
+                logger.debug(f"Finished processing result page {page_number}")
+        except Exception as e:
+            logger.error(f"❌ Error collecting assets with {self._search.name} search: {e}")
+            raise
+        finally:
+            pages.close()
 
 
 # --- Export selection: shared by API and existing JSON records ---
@@ -1248,6 +1397,9 @@ Examples:
   # Run direct one-stage export (no JSON file written)
   python export_xmp.py --direct-xmp
 
+  # Opt in to the structured search API (Immich v3.2.0 or newer)
+  python export_xmp.py --search-api structured
+
   # Export only assets with any valid face area
   python export_xmp.py --export assets-with-faces
 
@@ -1286,6 +1438,10 @@ Examples:
     parser.add_argument("--max-assets", type=int, default=None, help="Maximum number of assets to process (for debugging)")
     parser.add_argument("--album-id", type=str, default=None, help="Process only assets from this specific album ID")
     parser.add_argument("--library-id", type=str, default=None, help="Process only assets from this specific library ID")
+    parser.add_argument(
+        "--search-api", choices=["legacy", "structured"], default=None,
+        help="Immich search API; overrides environment/config (default: legacy)",
+    )
     parser.add_argument("--debug", action="store_true", help="Enable debug logging for detailed outputs")
 
     args = parser.parse_args()
@@ -1317,6 +1473,11 @@ def main() -> int:
     config.log_config_summary()
     if not config.validate_immich_config():
         return 1
+    try:
+        api_settings = ApiSettings.from_config(config, search_api=args.search_api)
+    except ValueError as error:
+        logger.error(f"❌ Configuration error: {error}")
+        return 1
 
     output_config = config.get_output_config()
     immich_config = config.get_immich_config()
@@ -1327,10 +1488,11 @@ def main() -> int:
     logger.debug(f"JSON output directory: {json_dir}")
     logger.debug(f"XMP output directory: {xmp_dir}")
     logger.info(f"   Export mode: {args.export}")
+    logger.info(f"   Search API: {api_settings.search_api}")
     if args.max_assets:
         logger.info(f"   Maximum assets to process: {args.max_assets}")
 
-    with ImmichClient(ApiSettings.from_config(config)) as client:
+    with ImmichClient(api_settings) as client:
         if not immich_config["api_key"] and not client.authenticate(immich_config["email"], immich_config["password"]):
             logger.error("❌ Authentication failed. Please check your credentials and server URL.")
             return 1
