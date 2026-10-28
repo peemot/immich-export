@@ -76,7 +76,8 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual("https://env.invalid", config.get_immich_config()["base_url"])
         self.assertEqual("env-key", config.get_immich_config()["api_key"])
         self.assertEqual(
-            {"request_timeout": 7, "retry_attempts": 5, "face_request_workers": 8}, config.get_settings_config()
+            {"request_timeout": 7, "retry_attempts": 5, "face_request_workers": 8, "search_api": "legacy"},
+            config.get_settings_config(),
         )
         self.assertEqual({"xmp_export_dir": "env-xmp", "json_export_dir": "file-json"}, config.get_output_config())
         self.assertTrue(config.validate_immich_config())
@@ -111,6 +112,36 @@ class ConfigurationTests(unittest.TestCase):
                 config = exporter.ConfigLoader(str(self.path))
                 with patch.object(exporter.logger, "error"):
                     self.assertEqual(expected, config.validate_immich_config())
+
+    def test_search_api_resolves_cli_environment_file_and_default_in_order(self):
+        cases = (
+            ({}, None, None, "legacy"),
+            ({"search_api": "structured"}, None, None, "structured"),
+            ({"search_api": "structured"}, "legacy", None, "legacy"),
+            ({"search_api": "legacy"}, "structured", None, "structured"),
+            ({"search_api": "legacy"}, "structured", "legacy", "legacy"),
+            ({"search_api": "invalid"}, "invalid", "structured", "structured"),
+        )
+        for settings, environment, cli, expected in cases:
+            with self.subTest(settings=settings, environment=environment, cli=cli):
+                self.path.write_text(json.dumps({"settings": settings}), encoding="utf-8")
+                overrides = {"IMMICH_SEARCH_API": environment} if environment is not None else {}
+                with patch.dict(os.environ, overrides, clear=True):
+                    config = exporter.ConfigLoader(str(self.path))
+                before = config.get_settings_config().copy()
+                resolved = exporter.ApiSettings.from_config(config, search_api=cli)
+                self.assertEqual(expected, resolved.search_api)
+                self.assertEqual(before, config.get_settings_config())
+
+    def test_invalid_search_api_settings_are_rejected_at_client_boundary(self):
+        for value in ("auto", "", "STRUCTURED", False, 1, [], {}):
+            with self.subTest(value=value):
+                self.path.write_text(json.dumps({"settings": {"search_api": value}}), encoding="utf-8")
+                config = exporter.ConfigLoader(str(self.path))
+                with self.assertRaisesRegex(ValueError, "'legacy' or 'structured'"):
+                    exporter.ApiSettings.from_config(config)
+        with self.assertRaisesRegex(ValueError, "'legacy' or 'structured'"):
+            exporter.ApiSettings("https://example.invalid", search_api="auto")
 
 
 class HttpTests(unittest.TestCase):
@@ -257,6 +288,7 @@ class CommandLineTests(unittest.TestCase):
         for args in (
             ["--stage2-only"], ["--stage1-only", "--direct-xmp"],
             ["--direct-xmp", "--json-file", "data.json"], ["--export", "invalid"],
+            ["--search-api", "auto"],
         ):
             with self.subTest(args=args), patch.object(sys, "argv", ["export_xmp.py", *args]):
                 with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as raised:
@@ -290,6 +322,7 @@ class CommandLineTests(unittest.TestCase):
                 self.assertEqual(api_key, client.settings.api_key)
                 self.assertEqual(12, client.settings.request_timeout)
                 self.assertEqual(2, client.settings.retry_attempts)
+                self.assertEqual("legacy", client.settings.search_api)
                 if api_key:
                     login.assert_not_called()
                     self.assertIsNone(client.access_token)
@@ -309,6 +342,45 @@ class CommandLineTests(unittest.TestCase):
                     else:
                         stage2.assert_called_once_with("interim.json", "cli-xmp", "assets-with-faces")
                 session.close.assert_called_once_with()
+
+    def test_cli_search_api_override_reaches_every_online_mode(self):
+        for mode in ([], ["--stage1-only"], ["--direct-xmp"]):
+            with self.subTest(mode=mode):
+                config = config_stub()
+                config.get_settings_config.return_value["search_api"] = "invalid"
+                with (
+                    patch.object(sys, "argv", ["export_xmp.py", *mode, "--search-api", "structured"]),
+                    patch.object(exporter, "setup_logging"),
+                    patch.object(exporter, "ConfigLoader", return_value=config),
+                    patch.object(exporter, "create_http_session"),
+                    patch.object(exporter, "export_assets_to_json", return_value="interim.json") as stage1,
+                    patch.object(exporter, "export_assets_to_xmp_from_json", return_value=True),
+                    patch.object(exporter, "export_assets_to_xmp", return_value=True) as direct,
+                    self.assertLogs(exporter.logger, level="INFO") as messages,
+                ):
+                    self.assertEqual(0, exporter.main())
+                client = (direct if mode == ["--direct-xmp"] else stage1).call_args.args[0]
+                self.assertEqual("structured", client.settings.search_api)
+                self.assertTrue(any("Search API: structured" in message for message in messages.output))
+
+    def test_invalid_configured_search_api_fails_before_http_or_output(self):
+        config = config_stub()
+        config.get_settings_config.return_value["search_api"] = "auto"
+        with (
+            patch.object(sys, "argv", ["export_xmp.py"]),
+            patch.object(exporter, "setup_logging"),
+            patch.object(exporter, "ConfigLoader", return_value=config),
+            patch.object(exporter, "create_http_session") as create,
+            patch.object(exporter, "export_assets_to_json") as stage1,
+            patch.object(exporter, "export_assets_to_xmp") as direct,
+            self.assertLogs(exporter.logger, level="ERROR") as messages,
+        ):
+            self.assertEqual(1, exporter.main())
+        create.assert_not_called()
+        stage1.assert_not_called()
+        direct.assert_not_called()
+        self.assertTrue(any("Configuration error:" in message and "--search-api" in message
+                            for message in messages.output))
 
     def test_failed_stages_return_nonzero_in_every_processing_mode(self):
         cases = (
@@ -376,7 +448,7 @@ with patch('requests.sessions.Session.request', side_effect=AssertionError('Unex
                 "stage1_only": False, "stage2_only": False, "direct_xmp": False,
                 "export": "all-assets", "json_file": None, "json_dir": None,
                 "xmp_dir": None, "max_assets": None, "album_id": None,
-                "library_id": None, "debug": False,
+                "library_id": None, "search_api": None, "debug": False,
             }, vars(exporter.parse_arguments()))
 
     def test_nonpositive_limits_are_accepted_by_parser(self):
@@ -385,7 +457,8 @@ with patch('requests.sessions.Session.request', side_effect=AssertionError('Unex
                 self.assertEqual(int(value), exporter.parse_arguments().max_assets)
 
     def test_argument_errors_exit_two_in_real_entrypoint(self):
-        for arguments in (("--stage2-only",), ("--export", "invalid"), ("--direct-xmp", "--stage1-only")):
+        for arguments in (("--stage2-only",), ("--export", "invalid"), ("--direct-xmp", "--stage1-only"),
+                          ("--search-api", "auto")):
             with self.subTest(arguments=arguments):
                 result = self.run_entrypoint(*arguments)
                 self.assertEqual(2, result.returncode, result.stderr)
@@ -396,6 +469,17 @@ with patch('requests.sessions.Session.request', side_effect=AssertionError('Unex
         result = self.run_entrypoint()
         self.assertEqual(1, result.returncode, result.stderr)
         self.assertIn("Configuration error:", result.stderr)
+        self.assertEqual(["config.json"], [path.name for path in self.root.iterdir()])
+
+    def test_invalid_search_api_exits_cleanly_without_network(self):
+        (self.root / "config.json").write_text(json.dumps({
+            "immich": {"base_url": "https://example.invalid", "api_key": "test-key"},
+            "settings": {"search_api": "auto"},
+        }), encoding="utf-8")
+        result = self.run_entrypoint()
+        self.assertEqual(1, result.returncode, result.stderr)
+        self.assertIn("--search-api", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
         self.assertEqual(["config.json"], [path.name for path in self.root.iterdir()])
 
     def test_handled_stage2_failures_exit_nonzero_in_real_entrypoint(self):
@@ -468,6 +552,7 @@ with patch('requests.sessions.Session.request', side_effect=AssertionError('Unex
         result = self.run_entrypoint(
             "--stage2-only", "--json-file", str(source), "--xmp-dir", str(output),
             "--max-assets", "1", "--album-id", "ignored-album", "--library-id", "ignored-library",
+            "--search-api", "structured",
         )
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertNotIn("Configuration error:", result.stderr)
@@ -478,7 +563,9 @@ with patch('requests.sessions.Session.request', side_effect=AssertionError('Unex
     def test_stage2_uses_configured_output_without_validating_immich_credentials(self):
         source = self.root / "source.json"
         source.write_text('{"assets": [{"asset_id": "photo", "people": []}]}', encoding="utf-8")
-        (self.root / "config.json").write_text(json.dumps({"output": {"xmp_export_dir": "from-config"}}), encoding="utf-8")
+        (self.root / "config.json").write_text(json.dumps({
+            "output": {"xmp_export_dir": "from-config"}, "settings": {"search_api": "invalid"},
+        }), encoding="utf-8")
         result = self.run_entrypoint("--stage2-only", "--json-file", str(source))
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertNotIn("Configuration error:", result.stderr)
