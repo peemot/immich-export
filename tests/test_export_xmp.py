@@ -800,22 +800,52 @@ LEGACY_JSON = (
 )
 
 
+def structured_api_data(data=None):
+    """Express synthetic result pages with opaque cursors instead of page numbers."""
+    data = copy.deepcopy(compatibility_api_data() if data is None else data)
+    keys = list(data["pages"])
+    cursors = {key: None if index == 0 else f"opaque-cursor/{index}+=end"
+               for index, key in enumerate(keys)}
+    pages = {}
+    for key, page in data["pages"].items():
+        assets = page["assets"]
+        next_page = assets.pop("nextPage")
+        assets["nextCursor"] = cursors[next_page] if next_page is not None else None
+        pages[cursors[key]] = page
+    data["pages"] = pages
+    return data
+
+
 class SyntheticAPI:
     """In-memory transport; face requests still run in real worker threads."""
 
-    def __init__(self, data=None):
+    def __init__(self, data=None, *, search_api="legacy"):
         self.data = compatibility_api_data() if data is None else data
+        self.search_api = search_api
         self.face_errors = {}
         self.page_errors = {}
         self.calls = []
         self.unexpected_calls = []
         self.lock = threading.Lock()
+        self.structured_pages_requested = 0
 
     def request(self, method, url, **kwargs):
         with self.lock:
             self.calls.append((method, url, copy.deepcopy(kwargs)))
         if (method, url) == ("POST", "https://example.invalid/api/search/metadata"):
-            key = str(kwargs["json"]["page"])
+            payload = kwargs["json"]
+            if self.search_api == "structured":
+                if "page" in payload or "filter" not in payload:
+                    self.unexpected_calls.append("Structured mode sent a legacy search request")
+                    raise AssertionError(self.unexpected_calls[-1])
+                key = payload.get("cursor")
+                if key is None:
+                    self.structured_pages_requested = 0
+                self.structured_pages_requested += 1
+                if self.structured_pages_requested > len(self.data["pages"]) + 1:
+                    raise AssertionError("Structured pagination looped without rejecting a repeated cursor")
+            else:
+                key = str(payload["page"])
             if key in self.page_errors:
                 raise self.page_errors[key]
             values = self.data["pages"]
@@ -852,7 +882,7 @@ def configured_client():
 
 
 @contextmanager
-def api_environment(api=None):
+def api_environment(api=None, *, search_api="legacy"):
     api = SyntheticAPI() if api is None else api
     config = Mock(spec=exporter.ConfigLoader)
     config.get_immich_config.return_value = {
@@ -860,6 +890,7 @@ def api_environment(api=None):
     }
     config.get_settings_config.return_value = {
         "face_request_workers": 2, "retry_attempts": 0, "request_timeout": 12,
+        "search_api": search_api,
     }
     config.get_output_config.return_value = {"json_export_dir": "json_exports", "xmp_export_dir": "xmp_sidecars"}
     config.validate_immich_config.return_value = True
@@ -1073,6 +1104,44 @@ class CompatibilityBoundaryTests(unittest.TestCase):
                 self.assertEqual(expected, api.search_payloads())
                 if mode == "assets-with-known-visible-faces":
                     self.assertTrue({"unknown", "empty", "hidden"}.isdisjoint(api.face_ids()))
+
+    def test_legacy_rejects_cursor_responses_before_faces_without_switching_api(self):
+        pagination_cases = (
+            {"nextCursor": None},
+            {"nextCursor": "opaque-cursor"},
+            {"nextPage": "2", "nextCursor": "opaque-cursor"},
+            {"nextPage": None, "nextCursor": "opaque-cursor"},
+        )
+        for nested, pagination in product((False, True), pagination_cases):
+            with self.subTest(nested=nested, pagination=pagination):
+                raw = compatibility_api_data()
+                response = {"items": raw["pages"]["1"]["assets"]["items"], **pagination}
+                raw["pages"]["1"] = {"assets": response} if nested else response
+                api = SyntheticAPI(raw)
+                with api_environment(api), configured_client() as client:
+                    with self.assertLogs(exporter.logger, level="ERROR"), self.assertRaises(RuntimeError) as raised:
+                        list(exporter.process_assets(client))
+                self.assertIn("--search-api structured", str(raised.exception))
+                self.assertEqual([{"page": 1, "size": 1000, "withExif": True}], api.search_payloads())
+                self.assertEqual([], api.face_ids())
+
+    def test_legacy_pages_accept_null_nextcursor_alongside_nextpage(self):
+        for nested in (False, True):
+            with self.subTest(nested=nested):
+                raw = compatibility_api_data()
+                expected_ids = []
+                for key, page in raw["pages"].items():
+                    assets = page["assets"]
+                    expected_ids.extend(item["id"] for item in assets["items"])
+                    assets["nextCursor"] = None
+                    if not nested:
+                        raw["pages"][key] = assets
+                api = SyntheticAPI(raw)
+                with api_environment(api), configured_client() as client:
+                    records = list(exporter.process_assets(client))
+                self.assertEqual(expected_ids, [record["asset_id"] for record in records])
+                self.assertEqual([1, 2, 3], [payload["page"] for payload in api.search_payloads()])
+                self.assertCountEqual(expected_ids, api.face_ids())
 
     def test_face_failure_after_limit_is_not_observed_even_though_fetch_ran(self):
         for mode, limit, failed_id, expected_ids in (
@@ -1820,6 +1889,325 @@ class FunctionalBoundaryTests(unittest.TestCase):
         records.close()
         self.assertEqual([True], closed)
 
+class StructuredSearchTests(unittest.TestCase):
+    """Exercise the public pipeline against the structured search wire contract."""
+
+    def test_structured_payload_maps_filters_and_uses_only_opaque_cursors(self):
+        for mode, album_id, library_id in product(EXPORT_MODES, (None, "album-a"), (None, "library-b")):
+            with self.subTest(mode=mode, album_id=album_id, library_id=library_id):
+                api = SyntheticAPI(structured_api_data(), search_api="structured")
+                with api_environment(api, search_api="structured"), configured_client() as client:
+                    list(exporter.process_assets(client, album_id=album_id, library_id=library_id, export=mode))
+                filters = {"trashedAt": {"eq": None}}
+                if album_id:
+                    filters["albumIds"] = {"all": [album_id]}
+                if library_id:
+                    filters["libraryId"] = {"eq": library_id}
+                expected = []
+                for cursor in api.data["pages"]:
+                    payload = {"size": 1000, "withExif": True, "filter": filters}
+                    if mode == "assets-with-known-visible-faces":
+                        payload["withPeople"] = True
+                    if cursor is not None:
+                        payload["cursor"] = cursor
+                    expected.append(payload)
+                self.assertEqual(expected, api.search_payloads())
+                # Auth scope is supplied by Immich; no new owner lookup or restriction.
+                self.assertTrue(all(url.endswith(("/search/metadata", "/faces")) for _, url, _ in api.calls))
+
+    def test_structured_and_legacy_produce_equal_json_and_xmp_for_every_selection(self):
+        for mode, limit in product(EXPORT_MODES, (None, 2)):
+            with self.subTest(mode=mode, limit=limit), tempfile.TemporaryDirectory() as directory:
+                raw = compatibility_api_data()
+                # The legacy INNER JOIN requires an EXIF row. An empty object
+                # represents a present row without the selected metadata fields.
+                raw["pages"]["1"]["assets"]["items"][1]["exifInfo"] = {}
+                results = {}
+                for protocol in ("legacy", "structured"):
+                    work = Path(directory) / protocol
+                    data = copy.deepcopy(raw) if protocol == "legacy" else structured_api_data(raw)
+                    api = SyntheticAPI(data, search_api=protocol)
+                    with api_environment(api, search_api=protocol), configured_client() as client:
+                        source = exporter.export_assets_to_json(
+                            client, str(work / "json"), max_assets=limit, album_id="album-a",
+                            library_id="library-b", export=mode,
+                        )
+                        self.assertIsNotNone(source)
+                        exported = json.loads(Path(source).read_bytes())
+                        self.assertTrue(exporter.export_assets_to_xmp_from_json(source, str(work / "staged"), mode))
+                        self.assertTrue(exporter.export_assets_to_xmp(
+                            client, str(work / "direct"), max_assets=limit, album_id="album-a",
+                            library_id="library-b", export=mode,
+                        ))
+                    outputs = {}
+                    for kind in ("staged", "direct"):
+                        output = work / kind
+                        outputs[kind] = {
+                            path.relative_to(output).as_posix(): path.read_bytes()
+                            for path in output.rglob("*.xmp")
+                        }
+                        summary = json.loads((output / "export_summary.json").read_bytes())
+                        summary.pop("output_directory")
+                        summary.pop("json_source", None)
+                        outputs[kind + "_summary"] = summary
+                    self.assertEqual(set(outputs["staged"]), set(outputs["direct"]))
+                    for path in outputs["staged"]:
+                        self.assertEqual(xmp_semantics(outputs["staged"][path]),
+                                         xmp_semantics(outputs["direct"][path]))
+                    self.assertEqual(outputs["staged_summary"], outputs["direct_summary"])
+                    if limit is not None:
+                        expected_ids = {
+                            "all-assets": {"unknown", "empty"},
+                            "assets-with-faces": {"unknown", "hidden"},
+                            "assets-with-known-visible-faces": {"rich", "zero-area"},
+                        }[mode]
+                        self.assertEqual(expected_ids, {item["asset_id"] for item in exported["assets"]})
+                    results[protocol] = exported, outputs
+                self.assertEqual(results["legacy"], results["structured"])
+
+    def test_missing_exif_rows_are_excluded_but_empty_metadata_is_retained(self):
+        raw = structured_api_data()
+        prototype = raw["pages"][None]["assets"]["items"][0]
+        absent = {key: value for key, value in prototype.items() if key != "exifInfo"}
+        absent["id"] = "absent"
+        items = [absent, {**prototype, "id": "null", "exifInfo": None},
+                 {**prototype, "id": "empty-exif", "exifInfo": {}},
+                 {**prototype, "id": "rich-exif", "exifInfo": {"iso": 0, "description": ""}}]
+        raw["pages"] = {None: {"assets": {"items": items, "nextCursor": None}}}
+        raw["faces"] = {"empty-exif": [], "rich-exif": []}
+        api = SyntheticAPI(raw, search_api="structured")
+        with api_environment(api, search_api="structured"), configured_client() as client:
+            records = list(exporter.process_assets(client))
+        self.assertEqual(["empty-exif", "rich-exif"], [item["asset_id"] for item in records])
+        self.assertEqual({}, records[0]["exifInfo"])
+        self.assertEqual({"iso": 0, "description": ""}, records[1]["exifInfo"])
+        self.assertCountEqual(["empty-exif", "rich-exif"], api.face_ids())
+
+    def test_short_pages_continue_when_first_page_is_rejected_by_person_filter(self):
+        api = SyntheticAPI(structured_api_data(), search_api="structured")
+        with api_environment(api, search_api="structured"), configured_client() as client:
+            records = list(exporter.process_assets(client, export="assets-with-known-visible-faces"))
+        self.assertEqual(list(api.data["pages"]), [item.get("cursor") for item in api.search_payloads()])
+        self.assertTrue({"unknown", "empty", "hidden"}.isdisjoint(api.face_ids()))
+        self.assertEqual("rich", records[0]["asset_id"])
+        self.assertEqual("orientation-8", records[-1]["asset_id"])
+
+    def test_empty_raw_page_with_cursor_continues_to_later_results(self):
+        raw = structured_api_data()
+        raw["pages"][None]["assets"]["items"] = []
+        api = SyntheticAPI(raw, search_api="structured")
+        with api_environment(api, search_api="structured"), configured_client() as client:
+            records = list(exporter.process_assets(client))
+        self.assertEqual("rich", records[0]["asset_id"])
+        self.assertEqual("orientation-8", records[-1]["asset_id"])
+        self.assertEqual(list(raw["pages"]), [item.get("cursor") for item in api.search_payloads()])
+
+    def test_null_cursor_ends_search_with_absent_or_null_nextpage(self):
+        for nested, include_next_page in product((False, True), (False, True)):
+            with self.subTest(nested=nested, include_next_page=include_next_page):
+                raw = structured_api_data()
+                first = raw["pages"][None]["assets"]
+                first["items"][1]["exifInfo"] = {}
+                first["nextCursor"] = None
+                if include_next_page:
+                    first["nextPage"] = None
+                raw["pages"][None] = {"assets": first} if nested else first
+                api = SyntheticAPI(raw, search_api="structured")
+                with api_environment(api, search_api="structured"), configured_client() as client:
+                    records = list(exporter.process_assets(client))
+                self.assertEqual(["unknown", "empty", "hidden"], [item["asset_id"] for item in records])
+                self.assertEqual([None], [item.get("cursor") for item in api.search_payloads()])
+
+    def test_structured_rejects_legacy_pagination_before_hydration(self):
+        for nested, terminal, empty in product((False, True), (False, True), (False, True)):
+            with self.subTest(nested=nested, terminal=terminal, empty=empty):
+                raw = structured_api_data()
+                first = raw["pages"][None]["assets"]
+                first["nextPage"] = "2"
+                if terminal:
+                    first["nextCursor"] = None
+                if empty:
+                    first["items"] = []
+                raw["pages"][None] = {"assets": first} if nested else first
+                api = SyntheticAPI(raw, search_api="structured")
+                with api_environment(api, search_api="structured"), configured_client() as client:
+                    with self.assertLogs(exporter.logger, level="ERROR"), self.assertRaises(RuntimeError) as raised:
+                        list(exporter.process_assets(client))
+                self.assertIn("structured", str(raised.exception).lower())
+                self.assertIn("nextPage", str(raised.exception))
+                self.assertEqual([None], [item.get("cursor") for item in api.search_payloads()])
+                self.assertEqual([], api.face_ids())
+
+    def test_interleaved_searches_keep_pagination_independent_when_one_is_abandoned(self):
+        for protocol in ("legacy", "structured"):
+            with self.subTest(protocol=protocol):
+                raw = compatibility_api_data()
+                for page in raw["pages"].values():
+                    page["assets"]["items"] = page["assets"]["items"][:1]
+                if protocol == "structured":
+                    raw = structured_api_data(raw)
+                api = SyntheticAPI(raw, search_api=protocol)
+                with api_environment(api, search_api=protocol), configured_client() as client:
+                    abandoned = client.iter_assets()
+                    completed = client.iter_assets()
+                    try:
+                        self.assertEqual("unknown", next(abandoned)["asset_id"])
+                        self.assertEqual("unknown", next(completed)["asset_id"])
+                        self.assertEqual("rich", next(abandoned)["asset_id"])
+                        abandoned.close()
+                        self.assertEqual(["rich", "orientation-2"],
+                                         [item["asset_id"] for item in completed])
+                    finally:
+                        abandoned.close()
+                        completed.close()
+                keys = list(raw["pages"])
+                expected = [keys[0], keys[0], keys[1], keys[1], keys[2]]
+                actual = [item.get("cursor") if protocol == "structured" else str(item["page"])
+                          for item in api.search_payloads()]
+                self.assertEqual(expected, actual)
+
+    def test_missing_cursor_is_a_compatibility_error_without_legacy_fallback(self):
+        for items in ([], [{"id": "photo", "exifInfo": {}}]):
+            with self.subTest(items=items):
+                raw = {"pages": {None: {"assets": {"items": items, "nextPage": None}}}, "faces": {}}
+                api = SyntheticAPI(raw, search_api="structured")
+                with api_environment(api, search_api="structured"), configured_client() as client:
+                    with self.assertLogs(exporter.logger, level="ERROR"), self.assertRaises(RuntimeError) as raised:
+                        list(exporter.process_assets(client))
+                self.assertIn("structured", str(raised.exception).lower())
+                self.assertEqual(1, len(api.search_payloads()))
+                self.assertEqual([], api.face_ids())
+
+    def test_invalid_cursor_and_item_shapes_fail_before_face_requests(self):
+        responses = [
+            {"assets": {"items": [], "nextCursor": value}}
+            for value in ("", 0, False, [], {})
+        ] + [
+            {"assets": {"items": value, "nextCursor": None}}
+            for value in (None, "invalid", {}, [None], ["not-an-asset"])
+        ]
+        for response in responses:
+            with self.subTest(response=response):
+                api = SyntheticAPI({"pages": {None: response}, "faces": {}}, search_api="structured")
+                with api_environment(api, search_api="structured"), configured_client() as client:
+                    with self.assertLogs(exporter.logger, level="ERROR"), self.assertRaises(ValueError):
+                        list(exporter.process_assets(client))
+                self.assertEqual(1, len(api.search_payloads()))
+                self.assertEqual([], api.face_ids())
+
+    def test_repeated_cursor_and_cursor_cycle_are_rejected_before_duplicate_hydration(self):
+        for repeat_on_page in (2, 3):
+            with self.subTest(repeat_on_page=repeat_on_page):
+                raw = structured_api_data()
+                keys = list(raw["pages"])
+                raw["pages"][keys[repeat_on_page - 1]]["assets"]["nextCursor"] = keys[1]
+                api = SyntheticAPI(raw, search_api="structured")
+                with api_environment(api, search_api="structured"), configured_client() as client:
+                    with self.assertLogs(exporter.logger, level="ERROR"), self.assertRaises(ValueError) as raised:
+                        list(exporter.process_assets(client))
+                self.assertIn("cursor", str(raised.exception).lower())
+                self.assertEqual(keys[:repeat_on_page], [item.get("cursor") for item in api.search_payloads()])
+                self.assertEqual(len(api.face_ids()), len(set(api.face_ids())))
+                last_items = raw["pages"][keys[repeat_on_page - 1]]["assets"]["items"]
+                self.assertTrue({item["id"] for item in last_items}.isdisjoint(api.face_ids()))
+
+    def test_unsupported_structured_requests_have_actionable_errors_without_retrying_legacy(self):
+        for status in (400, 404, 405, 410, 422):
+            with self.subTest(status=status):
+                api = SyntheticAPI(structured_api_data(), search_api="structured")
+                response = exporter.requests.Response()
+                response.status_code = status
+                api.page_errors[None] = exporter.requests.exceptions.HTTPError("request rejected", response=response)
+                with api_environment(api, search_api="structured"), configured_client() as client:
+                    with self.assertLogs(exporter.logger, level="ERROR"), self.assertRaises(RuntimeError) as raised:
+                        list(exporter.process_assets(client))
+                self.assertIn("structured", str(raised.exception).lower())
+                self.assertEqual(1, len(api.search_payloads()))
+                self.assertEqual([], api.face_ids())
+
+    def test_auth_and_server_errors_retain_the_original_http_error(self):
+        for status in (401, 403, 429, 500, 503):
+            with self.subTest(status=status):
+                api = SyntheticAPI(structured_api_data(), search_api="structured")
+                response = exporter.requests.Response()
+                response.status_code = status
+                error = exporter.requests.exceptions.HTTPError("search failed", response=response)
+                api.page_errors[None] = error
+                with api_environment(api, search_api="structured"), configured_client() as client:
+                    with self.assertLogs(exporter.logger, level="ERROR"), self.assertRaises(type(error)) as raised:
+                        list(exporter.process_assets(client))
+                self.assertIs(error, raised.exception)
+                self.assertEqual(1, len(api.search_payloads()))
+
+    def test_missing_face_endpoint_is_not_misreported_as_search_compatibility(self):
+        api = SyntheticAPI(structured_api_data(), search_api="structured")
+        response = exporter.requests.Response()
+        response.status_code = 404
+        error = exporter.requests.exceptions.HTTPError("face not found", response=response)
+        api.face_errors["unknown"] = error
+        with api_environment(api, search_api="structured"), configured_client() as client:
+            with self.assertLogs(exporter.logger, level="ERROR"), self.assertRaises(type(error)) as raised:
+                list(exporter.process_assets(client, max_assets=1))
+        self.assertIs(error, raised.exception)
+
+    def test_face_failure_beyond_selected_limit_is_not_consumed(self):
+        api = SyntheticAPI(structured_api_data(), search_api="structured")
+        api.face_errors["hidden"] = exporter.requests.exceptions.Timeout("unused later asset")
+        with api_environment(api, search_api="structured"), configured_client() as client:
+            records = list(exporter.process_assets(client, max_assets=1))
+        self.assertEqual(["unknown"], [item["asset_id"] for item in records])
+        self.assertIn("hidden", api.face_ids())
+        self.assertEqual(1, len(api.search_payloads()))
+
+    def test_incompatible_search_page_preserves_previous_json(self):
+        for failed_page, mismatch in product((0, 1), ("missing-cursor", "mixed-terminal", "mixed-continuing")):
+            with self.subTest(failed_page=failed_page, mismatch=mismatch), tempfile.TemporaryDirectory() as directory:
+                raw = structured_api_data()
+                keys = list(raw["pages"])
+                page = raw["pages"][keys[failed_page]]["assets"]
+                if mismatch == "missing-cursor":
+                    page.pop("nextCursor")
+                else:
+                    page["nextPage"] = str(failed_page + 2)
+                    if mismatch == "mixed-terminal":
+                        page["nextCursor"] = None
+                api = SyntheticAPI(raw, search_api="structured")
+                output = Path(directory)
+                previous = output / EXPORT_JSON_NAME
+                previous.write_bytes(b"previous complete export")
+                with api_environment(api, search_api="structured"), configured_client() as client:
+                    with self.assertLogs(exporter.logger, level="ERROR"):
+                        self.assertIsNone(exporter.export_assets_to_json(client, str(output)))
+                self.assertEqual(b"previous complete export", previous.read_bytes())
+                self.assertEqual([previous], list(output.iterdir()))
+                self.assertEqual(keys[:failed_page + 1],
+                                 [item.get("cursor") for item in api.search_payloads()])
+                self.assertCountEqual(["unknown", "hidden"] if failed_page else [], api.face_ids())
+
+    def test_mixed_pagination_failure_in_direct_export_removes_stale_success_summary(self):
+        for failed_page, terminal in product((0, 1), (False, True)):
+            with self.subTest(failed_page=failed_page, terminal=terminal), tempfile.TemporaryDirectory() as directory:
+                raw = structured_api_data()
+                keys = list(raw["pages"])
+                page = raw["pages"][keys[failed_page]]["assets"]
+                page["nextPage"] = str(failed_page + 2)
+                if terminal:
+                    page["nextCursor"] = None
+                api = SyntheticAPI(raw, search_api="structured")
+                output = Path(directory)
+                summary = output / "export_summary.json"
+                summary.write_text('{"export_status":"completed"}', encoding="utf-8")
+                with api_environment(api, search_api="structured"), configured_client() as client:
+                    with self.assertLogs(exporter.logger, level="ERROR"):
+                        self.assertFalse(exporter.export_assets_to_xmp(client, str(output)))
+                self.assertFalse(summary.exists())
+                self.assertFalse((output / ".export_summary.json.tmp").exists())
+                sidecars = {path.relative_to(output).as_posix() for path in output.rglob("*.xmp")}
+                self.assertEqual({"photos/unknown.jpg.xmp", "photos/hidden.jpg.xmp"} if failed_page else set(),
+                                 sidecars)
+                self.assertEqual(keys[:failed_page + 1],
+                                 [item.get("cursor") for item in api.search_payloads()])
+                self.assertCountEqual(["unknown", "hidden"] if failed_page else [], api.face_ids())
 
 
 if __name__ == "__main__":
