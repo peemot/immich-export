@@ -20,7 +20,7 @@ By default, it creates a sidecar for every matched asset. You can limit the expo
 ## Prerequisites
 
 1. Python 3.10+
-2. Immich v1.100.0 or newer
+2. Immich v1.100.0 or newer (see [Choosing the search API](#choosing-the-search-api))
 3. An Immich API key with at least `asset.read` and `face.read` permissions, or an Immich email/password login
 
 ## Quick start
@@ -107,8 +107,24 @@ Configuration is applied in this order:
 | `settings.request_timeout` | `IMMICH_REQUEST_TIMEOUT` | `30` | Network request timeout in seconds |
 | `settings.retry_attempts` | `IMMICH_RETRY_ATTEMPTS` | `3` | Retries for 429 and 5xx responses |
 | `settings.face_request_workers` | `IMMICH_FACE_REQUEST_WORKERS` | `8` | Concurrent `/api/faces` requests; clamped to 1-16 |
+| `settings.search_api` | `IMMICH_SEARCH_API` | `legacy` | Search protocol: `legacy` or `structured`; overridden by `--search-api` |
 | `output.xmp_export_dir` | `OUTPUT_XMP_DIR` | `xmp_sidecars` | Directory for generated `.xmp` files |
 | `output.json_export_dir` | `OUTPUT_JSON_DIR` | `json_exports` | Directory for intermediate JSON exports |
+
+### Choosing the search API
+
+The default is `legacy`. Opt in to the structured search API for one run:
+
+```bash
+python export_xmp.py --search-api structured
+```
+
+This option also works with `--stage1-only`, `--direct-xmp`, all `--export` values, and album/library filters. To select legacy mode explicitly, use `--search-api legacy`.
+
+For a persistent preference, optionally add `"search_api": "structured"` inside the existing `settings` object in `config.json`, or set `IMMICH_SEARCH_API=structured`. Selection precedence is CLI > environment > JSON > `legacy`.
+
+Structured search was introduced in [Immich v3.2.0](https://immich.app/blog/v3.2.0-release). [PR #30179](https://github.com/immich-app/immich/pull/30179) schedules removal of the legacy flat search fields in v4. Select structured mode when using a server that has removed those fields. The script uses the selected protocol explicitly and reports an error if the request is rejected or the response uses incompatible pagination. It does not switch modes automatically. Automated tests exercise the replacement API contract using simulated responses; they do not establish compatibility with a running Immich v4 server.
+
 
 ## Usage
 
@@ -137,6 +153,7 @@ All processing modes use the same `--export` selection rules.
 | `--xmp-dir` | `--xmp-dir ./xmps` | Directory for XMP sidecars; overrides config |
 | `--album-id` | `--album-id "uuid"` | Process only assets from one album |
 | `--library-id` | `--library-id "uuid"` | Process only assets from one library |
+| `--search-api` | `--search-api structured` | Select `legacy` or `structured`; default is legacy unless changed in config/environment |
 | `--max-assets` | `--max-assets 50` | Limit processed assets; useful for test runs |
 | `--debug` | `--debug` | Enable verbose logging |
 
@@ -226,6 +243,7 @@ To apply the sidecars, inspect the generated tree and copy or merge it into your
 | Unexpected output folder structure | XMP sidecars mirror Immich asset paths. Inspect `xmp_sidecars/` before merging it into your photo library. |
 | Large library behavior | Use `--max-assets`, `--album-id`, or `--library-id` for smaller test runs. |
 | Config file not found | Copy `config.json.template` to `config.json`, or configure the tool with environment variables. |
+| Structured search is not supported | Use Immich v3.2.0 or newer. Select `--search-api legacy` only if the server still supports the legacy search fields. |
 | Script is silent or seems stuck | Run with `--debug` for verbose logging. |
 
 ## Tests
@@ -241,11 +259,13 @@ The suite stays in two files and needs no additional test framework:
 
 | File | Regression coverage |
 |------|---------------------|
-| `tests/test_export_xmp.py` | Export selection, API-to-JSON field preservation, staged/direct output equivalence, all eight EXIF orientations, dimension fallbacks, camera/date/GPS metadata, XML escaping, keywords, summaries, write failures, and safe sidecar paths |
-| `tests/test_api_cli.py` | Config/environment precedence, credential validation, auth headers, HTTP error handling, retry policy, concurrent face ordering and session cleanup, CLI validation and mode routing |
+| `tests/test_export_xmp.py` | Legacy/structured request contracts and output parity, cursor pagination and failures, export selection, API-to-JSON field preservation, staged/direct output equivalence, all eight EXIF orientations, dimension fallbacks, camera/date/GPS metadata, XML escaping, keywords, summaries, write failures, and safe sidecar paths |
+| `tests/test_api_cli.py` | Config/environment/CLI precedence, search API selection and validation, offline Stage 2, credential validation, auth headers, HTTP error handling, retry policy, concurrent face ordering and session cleanup, CLI validation and mode routing |
 
 Tests parse generated XML and inspect actual temporary files. The suite blocks real HTTP requests and checks for attempted requests even if the exporter catches the resulting exception. Worker tests use real threads with bounded session-pool waits. No server, credentials, or personal export data are needed. The symlink test is skipped on systems where directory symlinks are unavailable.
 
 ## Contributing
+
+Within the single script, `LegacySearch` and `StructuredSearch` each own their request format, response validation, pagination and compatibility adjustments. `ImmichClient` selects one implementation and shares authentication, HTTP handling, face retrieval and export-record construction. JSON/XMP processing is common to both modes.
 
 Issues and pull requests are welcome.
