@@ -5,9 +5,7 @@
 
 Export metadata from [Immich](https://immich.app/) to `.xmp` sidecar files for use in photo tools such as digiKam, XnView MP, and Lightroom.
 
-The script reads asset metadata and face regions from the Immich API, then writes new files under separate output directories. It does not modify Immich records, edit your media files, or write sidecars into your photo library unless you copy them there yourself.
-
-By default, it creates a sidecar for every matched asset. You can limit the export to assets with faces, known visible faces, a specific album, or a specific library. The default workflow saves an intermediate JSON export before generating XMP.
+The script reads from Immich and writes separate JSON exports and XMP sidecars. It does not modify Immich records or your media files. By default, it exports every matched asset to JSON, then generates XMP sidecars. You can filter by faces, album, or library, or skip the intermediate JSON file.
 
 ## What gets exported
 
@@ -15,7 +13,6 @@ By default, it creates a sidecar for every matched asset. You can limit the expo
 - MWG-compatible face regions from Immich, with person names when available.
 - Known person names as XMP keywords.
 - XMP sidecars in a folder tree that mirrors the original Immich asset paths.
-- An optional intermediate JSON export and an `export_summary.json` report.
 
 ## Prerequisites
 
@@ -35,106 +32,61 @@ cd immich-export
 ### 2. Install dependencies
 
 ```bash
-pip install requests
+python -m pip install requests
 ```
 
 ### 3. Configure Immich access
 
-Copy the template and fill in your server URL and credentials:
+Copy [config.json.template](config.json.template) to `config.json`:
 
 ```bash
 cp config.json.template config.json
 ```
 
-Example `config.json`:
+On Windows, use `copy config.json.template config.json`.
 
-```json
-{
-  "immich": {
-    "base_url": "https://your-immich-server.com",
-    "api_key": "your-api-key",
-    "email": "",
-    "password": ""
-  },
-  "settings": {
-    "request_timeout": 30,
-    "retry_attempts": 3,
-    "face_request_workers": 8
-  },
-  "output": {
-    "xmp_export_dir": "xmp_sidecars",
-    "json_export_dir": "json_exports"
-  }
-}
-```
-
-If `api_key` is set, the script uses it and ignores `email` and `password`.
-
-You can also configure the connection with environment variables:
-
-```bash
-export IMMICH_BASE_URL="https://your-immich-server.com"
-export IMMICH_API_KEY="your-api-key"
-```
+Set `immich.base_url` to your server URL without an `/api` suffix. Fill in either `api_key` or both `email` and `password`; a non-empty API key takes precedence. Keep `config.json` out of version control.
 
 ### 4. Run the export
+
+Run from the project directory so the script can find `config.json` and use the expected relative output paths:
 
 ```bash
 python export_xmp.py
 ```
 
-The default run writes a JSON export first, then creates XMP files from that JSON. Use direct mode to skip the JSON file:
-
-```bash
-python export_xmp.py --direct-xmp
-```
-
 ## Configuration reference
 
-Configuration is applied in this order:
+The template includes every supported setting, with defaults for optional settings. Environment variables override `config.json`; command-line options override the corresponding search API and output-directory settings. Missing settings use built-in defaults.
 
-1. Command-line arguments for paths and execution options
-2. Environment variables for credentials and server settings
-3. `config.json`
-4. Built-in defaults
+| JSON path | Environment variable | Description |
+|-----------|----------------------|-------------|
+| `immich.base_url` | `IMMICH_BASE_URL` | Immich server URL |
+| `immich.api_key` | `IMMICH_API_KEY` | API key |
+| `immich.email` | `IMMICH_EMAIL` | Login email, used if no API key is set |
+| `immich.password` | `IMMICH_PASSWORD` | Login password, used if no API key is set |
+| `settings.request_timeout` | `IMMICH_REQUEST_TIMEOUT` | Request timeout in seconds |
+| `settings.retry_attempts` | `IMMICH_RETRY_ATTEMPTS` | Retries for 429 and 5xx responses |
+| `settings.face_request_workers` | `IMMICH_FACE_REQUEST_WORKERS` | Concurrent face requests; limited to 1-16 |
+| `settings.search_api` | `IMMICH_SEARCH_API` | `legacy` or `structured` |
+| `output.xmp_export_dir` | `OUTPUT_XMP_DIR` | XMP output directory |
+| `output.json_export_dir` | `OUTPUT_JSON_DIR` | JSON output directory |
 
-| JSON path | Environment variable | Default | Description |
-|-----------|----------------------|---------|-------------|
-| `immich.base_url` | `IMMICH_BASE_URL` | - | Immich server URL |
-| `immich.api_key` | `IMMICH_API_KEY` | - | API key; requires `asset.read` and `face.read` permissions |
-| `immich.email` | `IMMICH_EMAIL` | - | Login email, used only if no API key is set |
-| `immich.password` | `IMMICH_PASSWORD` | - | Login password, used only if no API key is set |
-| `settings.request_timeout` | `IMMICH_REQUEST_TIMEOUT` | `30` | Network request timeout in seconds |
-| `settings.retry_attempts` | `IMMICH_RETRY_ATTEMPTS` | `3` | Retries for 429 and 5xx responses |
-| `settings.face_request_workers` | `IMMICH_FACE_REQUEST_WORKERS` | `8` | Concurrent `/api/faces` requests; clamped to 1-16 |
-| `settings.search_api` | `IMMICH_SEARCH_API` | `legacy` | Search protocol: `legacy` or `structured`; overridden by `--search-api` |
-| `output.xmp_export_dir` | `OUTPUT_XMP_DIR` | `xmp_sidecars` | Directory for generated `.xmp` files |
-| `output.json_export_dir` | `OUTPUT_JSON_DIR` | `json_exports` | Directory for intermediate JSON exports |
+To configure access without a file, set `IMMICH_BASE_URL` and either `IMMICH_API_KEY` or both `IMMICH_EMAIL` and `IMMICH_PASSWORD`.
 
 ### Choosing the search API
 
-The default is `legacy`. Opt in to the structured search API for one run:
+The default is `legacy`. For a server using structured search, select it for one run:
 
 ```bash
 python export_xmp.py --search-api structured
 ```
 
-This option also works with `--stage1-only`, `--direct-xmp`, all `--export` values, and album/library filters. To select legacy mode explicitly, use `--search-api legacy`.
-
-For a persistent preference, optionally add `"search_api": "structured"` inside the existing `settings` object in `config.json`, or set `IMMICH_SEARCH_API=structured`. Selection precedence is CLI > environment > JSON > `legacy`.
-
-Structured search was introduced in [Immich v3.2.0](https://immich.app/blog/v3.2.0-release). [PR #30179](https://github.com/immich-app/immich/pull/30179) schedules removal of the legacy flat search fields in v4. Select structured mode when using a server that has removed those fields. The script uses the selected protocol explicitly and reports an error if the request is rejected or the response uses incompatible pagination. It does not switch modes automatically. Automated tests exercise the replacement API contract using simulated responses; they do not establish compatibility with a running Immich v4 server.
-
+For a persistent preference, set `settings.search_api` in `config.json` or `IMMICH_SEARCH_API`. Structured search requires [Immich v3.2.0](https://immich.app/blog/v3.2.0-release) or newer and is needed if your server no longer supports legacy search. The script does not switch automatically. Compatibility with a running Immich v4 server has not been verified.
 
 ## Usage
 
-```bash
-python export_xmp.py [OPTIONS]
-```
-
 ### Processing modes
-
-All processing modes use the same `--export` selection rules.
 
 | Flag | Description |
 |------|-------------|
@@ -145,24 +97,21 @@ All processing modes use the same `--export` selection rules.
 
 ### Options
 
-| Flag | Example | Description |
-|------|---------|-------------|
-| `--export` | `--export assets-with-faces` | Select which assets and face records to export. Default: `all-assets` |
-| `--json-file` | `--json-file data.json` | Existing JSON file for `--stage2-only` |
-| `--json-dir` | `--json-dir ./jsons` | Directory for JSON exports; overrides config |
-| `--xmp-dir` | `--xmp-dir ./xmps` | Directory for XMP sidecars; overrides config |
-| `--album-id` | `--album-id "uuid"` | Process only assets from one album |
-| `--library-id` | `--library-id "uuid"` | Process only assets from one library |
-| `--search-api` | `--search-api structured` | Select `legacy` or `structured`; default is legacy unless changed in config/environment |
-| `--max-assets` | `--max-assets 50` | Limit processed assets; useful for test runs |
-| `--debug` | `--debug` | Enable verbose logging |
+| Flag | Description |
+|------|-------------|
+| `--export VALUE` | Select assets and face records; Look at [Export selection](#export-selection); default: `all-assets` |
+| `--json-file FILE` | Existing JSON file for `--stage2-only` |
+| `--json-dir DIR` | JSON output directory |
+| `--xmp-dir DIR` | XMP output directory |
+| `--album-id UUID` | Process only assets from one album |
+| `--library-id UUID` | Process only assets from one library |
+| `--search-api MODE` | Select `legacy` or `structured` |
+| `--max-assets N` | Limit processed assets for a smaller test run |
+| `--debug` | Enable verbose logging |
 
 ### Examples
 
 ```bash
-# Default two-stage run: JSON export, then XMP generation
-python export_xmp.py
-
 # Direct Immich-to-XMP run
 python export_xmp.py --direct-xmp
 
@@ -175,25 +124,26 @@ python export_xmp.py --export assets-with-known-visible-faces
 # Export a single album or library
 python export_xmp.py --album-id "your-album-uuid"
 python export_xmp.py --library-id "your-library-uuid"
+
+# Generate XMP from an existing JSON export, without connecting to Immich
+python export_xmp.py --stage2-only --json-file data.json --xmp-dir xmp_sidecars
 ```
 
 ## Export selection
 
-`--export` controls both which assets are exported and which face records are written. The same rules apply in default, direct, Stage 1, and Stage 2 modes.
+`--export` selects both assets and face records in all processing modes.
 
-| Value | Assets included | Face records included | Use when you want |
-|-------|-----------------|-----------------------|-------------------|
-| `all-assets` | Every matched asset, including assets without faces | Face metadata when present | Sidecars for the whole selected set |
-| `assets-with-faces` | Only matched assets with at least one valid face region | All valid face records for those assets | Face-region exports, including unknown people |
-| `assets-with-known-visible-faces` | Only matched assets with at least one known, visible, non-hidden face | Only known, visible, non-hidden face records | Named-person exports without unknown or hidden faces |
+| Value | Assets included | Face records included |
+|-------|-----------------|-----------------------|
+| `all-assets` | Every matched asset, including assets without faces | Face metadata when present |
+| `assets-with-faces` | Assets with at least one valid face region | All valid face records, including unknown people |
+| `assets-with-known-visible-faces` | Assets with at least one known, visible, non-hidden face | Only known, visible, non-hidden face records |
 
 For `assets-with-known-visible-faces`, "known" means the person has a non-empty name other than `Unknown`. Hidden people and hidden or non-visible face records are excluded. Other asset metadata is still preserved for every exported asset.
 
-When using `--stage2-only`, the JSON file must already contain the assets and face records required by the selected export value. A JSON file created with a narrower `--export` value cannot restore data that was not written to that file.
+With `--stage2-only`, the JSON file must already contain the required assets and face records. A narrower JSON export cannot restore omitted data.
 
 ## Output structure
-
-The script writes to the configured output directories. It does not modify your original library.
 
 ### JSON export, Stage 1
 
@@ -202,9 +152,7 @@ json_exports/
 └── immich_assets_export_20260313_143022.json
 ```
 
-The intermediate file has `export_timestamp`, `immich_server`, `total_assets`, and an `assets` array. Each asset contains its ID, original path, file name, dimensions, `exifInfo`, and `people`. Each person's `faces` contain bounding boxes and, when available, the dimensions of the face-analysis image. For rotated photos, those dimensions can differ from the raw EXIF image dimensions. Stage 2 reads this file locally; it does not need an Immich connection or credentials when `--xmp-dir` is provided.
-
-JSON ordering is automatic: assets are sorted by `original_path`, then `asset_id`; people and faces are sorted by their IDs.
+The JSON export lets you generate XMP later without querying Immich again. With `--stage2-only --json-file FILE --xmp-dir DIR`, no server connection, credentials, or config file are needed.
 
 ### XMP sidecars, Stage 2 or direct mode
 
@@ -225,47 +173,34 @@ To apply the sidecars, inspect the generated tree and copy or merge it into your
 
 ## Safety and privacy notes
 
-- The script reads from Immich and writes separate JSON/XMP files. It does not edit image files or update Immich records.
-- `config.json` can contain an API key, email, or password. Do not commit it to version control.
 - Generated JSON and XMP files may contain names, face regions, GPS/location fields, camera metadata, timestamps, and original asset paths.
 - The script strips unsafe path components and refuses to write XMP files outside the configured output directory.
-- Asset search requests are paginated at 1000 assets per request. Face data is retrieved concurrently within each metadata page, using up to `settings.face_request_workers` `/api/faces` requests at a time. Requests are retried on 429 and 5xx responses.
 
 ## Troubleshooting
 
 | Problem | What to check |
 |---------|---------------|
-| Authentication failed | Check that `immich.base_url` does not end with `/api`. If using an API key, verify it has `asset.read` and `face.read` permissions. |
+| Authentication failed | Check the server URL and credentials. API keys need `asset.read` and `face.read` permissions. |
 | No XMP files were generated | Check filters, output permissions, and whether Immich returned any assets. Some `--export` modes intentionally skip assets. |
 | Missing face regions | Make sure face recognition has finished in Immich. Check whether the selected `--export` mode excludes unknown, hidden, or non-visible faces. |
 | Sidecars exist but contain no face regions | This can be expected. The default mode still creates sidecars for assets without writable face regions. |
 | Permission error or `Refusing to write outside output directory` | Check output-folder permissions and inspect any unusual asset paths. |
 | Unexpected output folder structure | XMP sidecars mirror Immich asset paths. Inspect `xmp_sidecars/` before merging it into your photo library. |
-| Large library behavior | Use `--max-assets`, `--album-id`, or `--library-id` for smaller test runs. |
+| Large library is slow | Try a smaller run with `--max-assets`, `--album-id`, or `--library-id`. |
 | Config file not found | Copy `config.json.template` to `config.json`, or configure the tool with environment variables. |
 | Structured search is not supported | Use Immich v3.2.0 or newer. Select `--search-api legacy` only if the server still supports the legacy search fields. |
 | Script is silent or seems stuck | Run with `--debug` for verbose logging. |
 
 ## Tests
 
-Install the runtime dependency and run the standard-library test suite from the repository root:
+Run from the project directory after installing the dependency:
 
 ```bash
-python -m pip install requests
 python -m unittest discover -s tests -v
 ```
 
-The suite stays in two files and needs no additional test framework:
-
-| File | Regression coverage |
-|------|---------------------|
-| `tests/test_export_xmp.py` | Legacy/structured request contracts and output parity, cursor pagination and failures, export selection, API-to-JSON field preservation, staged/direct output equivalence, all eight EXIF orientations, dimension fallbacks, camera/date/GPS metadata, XML escaping, keywords, summaries, write failures, and safe sidecar paths |
-| `tests/test_api_cli.py` | Config/environment/CLI precedence, search API selection and validation, offline Stage 2, credential validation, auth headers, HTTP error handling, retry policy, concurrent face ordering and session cleanup, CLI validation and mode routing |
-
-Tests parse generated XML and inspect actual temporary files. The suite blocks real HTTP requests and checks for attempted requests even if the exporter catches the resulting exception. Worker tests use real threads with bounded session-pool waits. No server, credentials, or personal export data are needed. The symlink test is skipped on systems where directory symlinks are unavailable.
+Tests run locally without an Immich server, credentials, or personal export data.
 
 ## Contributing
-
-Within the single script, `LegacySearch` and `StructuredSearch` each own their request format, response validation, pagination and compatibility adjustments. `ImmichClient` selects one implementation and shares authentication, HTTP handling, face retrieval and export-record construction. JSON/XMP processing is common to both modes.
 
 Issues and pull requests are welcome.
